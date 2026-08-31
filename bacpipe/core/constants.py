@@ -32,7 +32,7 @@ EMBEDDING_DIMENSIONS = {
     "perch_v2": 1536,
     "protoclr": 384,
     "rcl_fs_bsed": 2048,
-    "repertoire_embedder": 1024,
+    "repertoire_embedder": 256,
     "surfperch": 1280,
     "google_whale": 1280,
     "vggish": 128,
