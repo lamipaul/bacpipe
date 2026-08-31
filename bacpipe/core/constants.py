@@ -1,13 +1,11 @@
-
-
 TF_MODELS = [
-    'birdnet', 
-    'perch_v2',
-    'perch_bird', 
-    'google_whale', 
-    'surfperch', 
-    'vggish',
-    'hbdet', 
+    "birdnet",
+    "perch_v2",
+    "perch_bird",
+    "google_whale",
+    "surfperch",
+    "vggish",
+    "hbdet",
 ]
 """list[str]: models that were built using tensorflow"""
 
@@ -34,6 +32,7 @@ EMBEDDING_DIMENSIONS = {
     "perch_v2": 1536,
     "protoclr": 384,
     "rcl_fs_bsed": 2048,
+    "repertoire_embedder": 1024,
     "surfperch": 1280,
     "google_whale": 1280,
     "vggish": 128,
@@ -54,7 +53,8 @@ NEEDS_CHECKPOINT = [
     "mix2",
     "naturebeats",
     "protoclr",
-    "rcl_fs_bsed"
+    "rcl_fs_bsed",
+    "repertoire_embedder"
 ]
 """list[str]: models that require a checkpoint to be downloaded to be run"""
 
@@ -64,4 +64,3 @@ supported_models = list(EMBEDDING_DIMENSIONS.keys())
 
 models_needing_checkpoint = NEEDS_CHECKPOINT
 """list[str]: Models that require a checkpoint to be downloaded before use."""
-
