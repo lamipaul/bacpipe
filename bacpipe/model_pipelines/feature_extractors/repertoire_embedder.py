@@ -21,8 +21,7 @@ class Model(ModelBaseClass):
         self.model = torch.nn.Sequential(encoder, decoder)
         state_dict = torch.load(
             self.model_base_path / "repertoire_embedder" / "generic_embedder.weights",
-            map_location=self.device,
-            weights_only=False
+            map_location=self.device
         )
         self.model.load_state_dict(state_dict)
 
