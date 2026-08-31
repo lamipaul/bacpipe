@@ -17,12 +17,28 @@ from bacpipe.embedding_evaluation.label_embeddings import (
 logger = logging.getLogger("bacpipe")
 
 
-def save_logs():
+def save_logs(**kwargs):
+    """
+    Set up file logging for the current run and store a snapshot of the
+    current ``bacpipe.config`` and ``bacpipe.settings`` values.
+
+    Logs and JSON snapshots are written to a timestamped subdirectory
+    ``logs`` under the main results directory.
+
+    Parameters
+    ----------
+    **kwargs : dict
+        Explicitly passed kwargs override the defaults from
+        ``bacpipe/config.yaml`` and ``bacpipe/settings.yaml``, e.g.
+        ``main_results_dir`` and ``audio_dir``.
+    """
     import datetime
     import json
 
     log_dir = (
-        Path(settings.main_results_dir) / Path(config.audio_dir).stem / f"logs"
+        Path(kwargs.get("main_results_dir", settings.main_results_dir))
+        / Path(kwargs.get("audio_dir", config.audio_dir)).stem
+        / "logs"
     )
     log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -66,6 +82,20 @@ class Loader:
     as an attribute and will be saved after the successful run.
     kwargs that are not specifically passed will be taken from
     bacpipe.config and bacpipe.settings.
+
+    Examples::
+    
+        # Load the embeddings that were already computed for ``birdnet`` on the
+        # test data (stored under ``bacpipe_results``):
+
+        loader = bacpipe.Loader(
+            audio_dir='bacpipe/tests/test_data',
+            model_name='birdnet',
+            use_folder_structure=True,
+        )
+        embeddings = loader.embeddings(return_type='array')
+        loader.metadata_dict
+
     """
 
     def __init__(
@@ -85,6 +115,37 @@ class Loader:
         as an attribute and will be saved after the successful run.
         kwargs that are not specifically passed will be taken from
         bacpipe.config and bacpipe.settings.
+        
+        Example::
+        
+            import bacpipe
+
+            MODEL_NAME = 'birdnet'
+
+            # Create a loader object that will handle all the audio file, path and parameters needed to compute the embeddings for instance
+            loader_obj = bacpipe.Loader(
+                audio_dir='bacpipe/tests/test_data',
+                model_name=MODEL_NAME,
+                use_folder_structure=True
+            )
+
+            # Create an embededding object with the selected model (MODEL_NAME) passing the loader object in order to have the audio directory mapping
+            embed_obj = bacpipe.Embedder(
+                model_name=MODEL_NAME,
+                loader=loader_obj
+                )
+
+            # Process all files using multithreading
+            embed_obj.run_inference_pipeline_using_multithreading()
+
+            print('Metadata dict:', loader_obj.metadata_dict)
+
+            print('Embeddings (array):', loader_obj.embeddings(return_type='array'))
+
+            print('Predictions (array):', loader_obj.predictions(return_type='array'))
+
+            print('Predictions (dataframe):', loader_obj.predictions(return_type='dataframe'))
+        
 
         Parameters
         ----------
@@ -140,7 +201,9 @@ class Loader:
         else:
             if not model_name is None:
                 get_paths = make_set_paths_func(
-                    audio_dir, settings.main_results_dir
+                    audio_dir,
+                    kwargs.get("main_results_dir", settings.main_results_dir),
+                    evaluations_dir=kwargs.get("evaluations_dir"),
                 )
                 self.paths = get_paths(model_name)
             if not self.combination_already_exists:
@@ -156,13 +219,33 @@ class Loader:
                 )
 
     def _initialize_path_structure(self, testing=False, **kwargs):
-        # if testing:
-        #     kwargs["main_results_dir"] = "bacpipe/tests/results_files"
+        """
+        Set up the directory structure used for saving results. When
+        ``testing`` is True the main results directory is set to
+        ``bacpipe_results``. Any key/value pairs passed via ``kwargs`` are
+        stored as attributes on this Loader instance, after creating the
+        corresponding directories when needed.
 
+        Parameters
+        ----------
+        testing : bool, optional
+            whether this is a testing run, by default False
+        **kwargs : dict
+            additional path configuration values (e.g. ``main_results_dir``,
+            ``embed_parent_dir``, ``dim_reduc_parent_dir``,
+            ``evaluations_dir``)
+        """
+        if testing:
+            kwargs["main_results_dir"] = "bacpipe_results"
+            
         if self.use_folder_structure:
             from bacpipe import settings
+            default_kwargs = {**vars(settings)}
+            passed_kwargs = kwargs
+            for key, value in default_kwargs.items():
+                if not key in passed_kwargs:
+                    kwargs[key] = value
 
-            kwargs = {**vars(settings)}
 
         for key, val in kwargs.items():
             if key == "main_results_dir":
@@ -181,6 +264,12 @@ class Loader:
             setattr(self, key, val)
 
     def _check_embeds_already_exist(self):
+        """
+        Check whether embeddings for the current combination of model and
+        audio directory have already been computed. Sets
+        ``self.combination_already_exists`` accordingly and locates the
+        existing embedding directory if one is found.
+        """
         self.combination_already_exists = False
         self.dim_reduc_embed_dir = False
 
@@ -206,6 +295,11 @@ class Loader:
         self._find_existing_embed_dir(existing_embed_dirs)
 
     def _get_metadata_from_created_embeddings(self):
+        """
+        Update the metadata dictionary from already processed embedding
+        files found in ``self.embed_dir`` and remove the corresponding
+        audio files from ``self.files``.
+        """
         module = importlib.import_module(
             f"bacpipe.model_pipelines.feature_extractors.{self.model_name}"
         )
@@ -236,7 +330,7 @@ class Loader:
             except Exception as e:
                 logger.exception(
                     f"Unable to load file {file}. Continuing with the "
-                    f"next file. {e}"
+                    f"next file. {str(e)}"
                 )
                 continue
             self.metadata_dict["files"]["audio_files"].append(
@@ -264,6 +358,18 @@ class Loader:
     def _update_audio_file_list(
         self, audio_files, corresponding_audio_file_bool
     ):
+        """
+        Remove an audio file from ``self.files`` once it has been
+        accounted for in the metadata.
+
+        Parameters
+        ----------
+        audio_files : np.ndarray
+            array of all audio files
+        corresponding_audio_file_bool : np.ndarray
+            boolean array indicating which entry corresponds to the file
+            that was already processed
+        """
         self.files.remove(audio_files[corresponding_audio_file_bool][0])
 
     def _find_existing_embed_dir(self, existing_embed_dirs):
@@ -328,6 +434,11 @@ class Loader:
             # are we using a dimensionality reduction model?
             if self.dim_reduction_model:
                 if self.dim_reduction_model in d.stem:
+                    if (
+                        not settings.visualization_dimensions 
+                        == return_reduced_dimensions(d)
+                        ):
+                        continue
                     self.combination_already_exists = True
                     logger.info(
                         "\n### Embeddings already exist. "
@@ -364,13 +475,23 @@ class Loader:
                     )
                 ]
             )
-            logger.info(f"Found {num_files} embedding files.")
-            num_audio_files = len(self.get_audio_files(self.audio_dir))
+            if num_files == 0:
+                logger.info(
+                    f"\nNo embedding files were found. The directory {d} is empty and "
+                    "will therefore be deleted. \n"
+                )
+                import shutil
+
+                shutil.rmtree(d)
+                return
+            else:
+                logger.info(f"Found {num_files} embedding files.")
+                num_audio_files = len(self.get_audio_files(self.audio_dir))
         except AssertionError as e:
             self._get_metadata_dict(d)
             self.combination_already_exists = True
             logger.info(
-                f"\nError: {e}. "
+                f"\nError: {str(e)}. "
                 "Will proceed without veryfying if the number of embeddings "
                 "is the same as the number of audio files."
             )
@@ -425,6 +546,16 @@ class Loader:
                 self._handle_incomplete_run(d)
 
     def _handle_incomplete_run(self, directory):
+        """
+        Prepare the Loader to continue an incomplete run in the given
+        directory, by collecting the audio files and re-initializing the
+        metadata based on embeddings that were already created.
+
+        Parameters
+        ----------
+        directory : pathlib.Path
+            directory containing the partially processed embeddings
+        """
         self.continue_incomplete_run = True
         self.embed_dir = directory
         self.files = self.get_audio_files(self.audio_dir)
@@ -432,6 +563,10 @@ class Loader:
         self._get_metadata_from_created_embeddings()
 
     def _get_audio_paths_and_init_embed_dir(self):
+        """
+        Collect all audio files in the audio directory and initialize
+        ``self.embed_dir`` with a timestamp-based directory name.
+        """
         self.files = self.get_audio_files(self.audio_dir)
         self.files.sort()
         if not hasattr(self, "embed_parent_dir"):
@@ -443,6 +578,11 @@ class Loader:
         )
 
     def _get_annotation_files(self):
+        """
+        Find all annotation CSV files in the audio directory that
+        correspond to one of the audio files and store them in
+        ``self.annot_files``.
+        """
         all_annotation_files = list(self.audio_dir.rglob("*.csv"))
         audio_stems = [file.stem for file in self.files]
         self.annot_files = [
@@ -458,6 +598,14 @@ class Loader:
         """
         Collect all audio files in a given directory that have
         file endings that can be processed by bacpipe.
+        
+        Example::
+        
+            list_of_files = bacpipe.get_audio_files(
+                'bacpipe/tests/test_data', return_type='str'
+            )
+            # will return a list of audio files as strings 
+            # in a specified directory
 
         Parameters
         ----------
@@ -493,6 +641,11 @@ class Loader:
             return [str(f) for f in files_list]
 
     def _init_metadata_dict(self):
+        """
+        Initialize ``self.metadata_dict`` with the model name, audio
+        directory, embedding directory and empty per-file bookkeeping
+        lists.
+        """
         self.metadata_dict = {
             "model_name": self.model_name,
             "audio_dir": str(self.audio_dir),
@@ -504,7 +657,63 @@ class Loader:
             },
         }
 
+    @staticmethod
+    def _resolve_embed_dir(metadata_embed_dir, metadata_folder):
+        """
+        Resolve the ``embed_dir`` recorded in a ``metadata.yml`` file to a
+        directory that actually exists on disk.
+
+        Newer bacpipe versions store the absolute path of the embedding
+        directory in the metadata file. Older versions stored a path that
+        was relative to the working directory of the run that created the
+        metadata (e.g. ``bacpipe/evaluation/embeddings/<dir name>``). In
+        that case the actual directory is co-located in the results
+        directory, so we fall back to locating it by its directory name.
+
+        Parameters
+        ----------
+        metadata_embed_dir : str
+            value of the ``embed_dir`` key in the metadata file
+        metadata_folder : pathlib.Path
+            folder containing the ``metadata.yml`` file
+
+        Returns
+        -------
+        pathlib.Path
+            path to the embedding directory, resolved if possible,
+            otherwise the original (unresolved) value
+        """
+        embed_dir = Path(metadata_embed_dir)
+        if embed_dir.is_dir():
+            return embed_dir
+
+        # Older versions recorded a path relative to the run's working
+        # directory (e.g. ``bacpipe/evaluation/embeddings/<name>``). The
+        # actual directory is located in the results directory, typically
+        # as a sibling of the folder holding this metadata file, under its
+        # parent ``embeddings`` folder, or directly at the audio-stem level
+        # (``use_folder_structure=False`` runs).
+        name = embed_dir.name
+        for candidate in (
+            metadata_folder.parent.parent.joinpath("embeddings", name),
+            metadata_folder.parent.joinpath("embeddings", name),
+            metadata_folder.parent.joinpath(name),
+            metadata_folder.parent.parent.joinpath(name),
+        ):
+            if candidate.is_dir():
+                return candidate
+        return embed_dir
+
     def _get_metadata_dict(self, folder):
+        """
+        Load the metadata dictionary from the given folder and assign the
+        path-like entries as attributes on this Loader instance.
+
+        Parameters
+        ----------
+        folder : pathlib.Path
+            folder containing the ``metadata.yml`` file
+        """
         self.metadata_dict = load_metadata_file(folder)
 
         for key, val in self.metadata_dict.items():
@@ -513,7 +722,7 @@ class Loader:
                     continue
                 if not Path(val).is_dir():
                     if key == "embed_dir":
-                        val = folder.parent.joinpath(Path(val).stem)
+                        val = self._resolve_embed_dir(val, folder)
                     elif key == "audio_dir":
                         logger.info(
                             "The audio files are no longer where they used to be "
@@ -524,6 +733,12 @@ class Loader:
             self.dim_reduc_embed_dir = folder
 
     def _get_embeddings(self):
+        """
+        Locate the directory containing already computed embeddings and
+        store the embedding file list in ``self.files``. If the combination
+        does not exist yet, the metadata dictionary is initialized and a
+        new embedding directory name is created.
+        """
         embed_dir = self.get_embedding_dir()
         self.files = [f for f in embed_dir.rglob(f"*{self.embed_suffix}")]
         self.files.sort()
@@ -540,6 +755,16 @@ class Loader:
             self.embed_dir = embed_dir
 
     def get_embedding_dir(self):
+        """
+        Return the directory containing the embeddings for the current
+        model and audio directory combination, creating or locating it as
+        needed.
+
+        Returns
+        -------
+        pathlib.Path
+            path to the embedding directory
+        """
         if self.dim_reduction_model:
             if self.combination_already_exists:
                 self.embed_parent_dir = Path(self.dim_reduc_parent_dir)
@@ -565,6 +790,15 @@ class Loader:
         return self._find_existing_embed_dir(embed_dirs)
 
     def _get_timestamp_dir(self):
+        """
+        Create a timestamp-based directory name including the model name
+        and the audio directory stem.
+
+        Returns
+        -------
+        str
+            timestamp-based directory name
+        """
         if self.dim_reduction_model:
             model_name = self.dim_reduction_model
         elif not self.model_name:
@@ -577,6 +811,20 @@ class Loader:
         )
 
     def read_embedding_file(self, file):
+        """
+        Load an embedding file, record it in the metadata dictionary and
+        return the embeddings.
+
+        Parameters
+        ----------
+        file : pathlib.Path
+            path to the embedding file
+
+        Returns
+        -------
+        np.ndarray
+            loaded embeddings
+        """
         embeds = np.load(file)
         try:
             rel_file_path = file.relative_to(self.metadata_dict["embed_dir"])
@@ -603,6 +851,28 @@ class Loader:
 
     @staticmethod
     def filter_df_by_file(audio_dir, annots, file_path, sort_by_start=True):
+        """
+        Filter an annotations dataframe down to the rows belonging to a
+        single audio file. Multiple filename conventions are tried to
+        match the file to its annotations.
+
+        Parameters
+        ----------
+        audio_dir : str or pathlib.Path
+            path to the audio directory
+        annots : pd.DataFrame
+            annotations dataframe containing an ``audiofilename`` column
+        file_path : pathlib.Path
+            path to the audio file to filter for
+        sort_by_start : bool, optional
+            whether to sort the returned annotations by their start time,
+            by default True
+
+        Returns
+        -------
+        pd.DataFrame
+            annotations belonging to ``file_path``
+        """
         file_annots = annots[
             annots.audiofilename == file_path.relative_to(audio_dir)
         ]
@@ -635,6 +905,9 @@ class Loader:
         the first dimension corresponds to the timestamp and the
         second dimension to the embedding dimension.
 
+        For dimensionality reduction loaders the primary ``.npy``
+        embedding files are returned: the reduced coordinates are stored
+        as separate ``.json`` files in ``self.embed_dir``.
 
         Parameters
         ----------
@@ -647,23 +920,62 @@ class Loader:
             depending on `return_type` argument
         """
         d = {}
-        if not self.files[0].suffix == self.embed_suffix:
-            self.files = list(self.embed_dir.rglob(f"*{self.embed_suffix}"))
-            self.files.sort()
-        for file in self.files:
-            if not self.dim_reduction_model:
-                embeds = np.load(file)
+        if self.dim_reduction_model:
+            # ``embeddings()`` returns the model embeddings (the .npy files).
+            # A dimensionality reduction run stores its reduced coordinates
+            # as separate .json files inside ``self.embed_dir``; locate the
+            # primary embeddings through the directory recorded in the
+            # metadata of the reduced-embedding run.
+            if hasattr(self, "metadata_dict"):
+                embed_dir = self.metadata_dict["embed_dir"]
             else:
-                with open(file, "r") as f:
-                    embeds = json.load(f)
-                embeds = np.array(embeds)
-            d[str(file.relative_to(self.embed_dir))] = embeds
+                embed_dir = load_metadata_file(self.embed_dir)["embed_dir"]
+            embed_dir = self._resolve_embed_dir(embed_dir, self.embed_dir)
+            embed_suffix = ".npy"
+        else:
+            embed_dir = self.embed_dir
+            embed_suffix = self.embed_suffix
+        if not self.files or not self.files[0].suffix == embed_suffix:
+            embedding_files = list(embed_dir.rglob(f"*{embed_suffix}"))
+            if len(embedding_files) == 0:
+                logger.warning(
+                    "No embedding files were found. Check that the path is right "
+                    f"or if you actually have processed embeddings with {self.model_name} "
+                    f"for file in {self.audio_dir}."
+                )
+                return None
+            else:
+                self.files = embedding_files
+                self.files.sort()
+        for file in self.files:
+            embeds = np.load(file)
+            d[str(file.relative_to(embed_dir))] = embeds
         if return_type == "dict":
             return d
         elif return_type == "array":
             return np.vstack(list(d.values()))
 
     def get_preds_array(self, return_type="dict", preds_path=None, **kwargs):
+        """
+        Load the raw classifier predictions that were saved for the
+        current model and return them in the requested format.
+
+        Parameters
+        ----------
+        return_type : str, optional
+            return type either `array` or `dataframe`, by default 'dict'
+        preds_path : pathlib.Path, optional
+            path to the directory containing the prediction files, by
+            default None
+        **kwargs : dict
+            additional keyword arguments
+
+        Returns
+        -------
+        tuple or pd.DataFrame
+            tuple of (np.ndarray, dict) for `array`, tuple of
+            (dict, dict) for `dict` or pd.DataFrame for `dataframe`
+        """
         if preds_path is None:
             preds_path_loc = (
                 self.paths.preds_path / "original_classifier_outputs"
@@ -780,36 +1092,37 @@ class Loader:
         df_dict = {"start": [], "end": [], "audiofilename": []}
 
         total_length = 0
-        for idx, file in tqdm(
-            enumerate(files),
-            "Building continuous dataframe from processed predictions",
-            total=len(files),
-            leave=False,
-        ):
-            current_time_bins = nr_embeds_per_file[idx]
+        if len(active_bins_global) > 0:
+            for idx, file in tqdm(
+                enumerate(files),
+                "Building continuous dataframe from processed predictions",
+                total=len(files),
+                leave=False,
+            ):
+                current_time_bins = nr_embeds_per_file[idx]
 
-            # find active bins within this file's slice
-            active_in_file = (
-                active_bins_global[
-                    (active_bins_global >= total_length)
-                    & (active_bins_global < total_length + current_time_bins)
-                ]
-                - total_length
-            )  # make relative to file start
+                # find active bins within this file's slice
+                active_in_file = (
+                    active_bins_global[
+                        (active_bins_global >= total_length)
+                        & (active_bins_global < total_length + current_time_bins)
+                    ]
+                    - total_length
+                )  # make relative to file start
 
-            audio_filename = (
-                relative_audio_stems[idx] + "." + relative_audio_suffixes[idx]
-            )
+                audio_filename = (
+                    relative_audio_stems[idx] + "." + relative_audio_suffixes[idx]
+                )
 
-            df_dict["start"].extend((active_in_file * seg_len).tolist())
-            df_dict["end"].extend(
-                ((active_in_file * seg_len) + seg_len).tolist()
-            )
-            df_dict["audiofilename"].extend(
-                [audio_filename] * len(active_in_file)
-            )
+                df_dict["start"].extend((active_in_file * seg_len).tolist())
+                df_dict["end"].extend(
+                    ((active_in_file * seg_len) + seg_len).tolist()
+                )
+                df_dict["audiofilename"].extend(
+                    [audio_filename] * len(active_in_file)
+                )
 
-            total_length += current_time_bins
+                total_length += current_time_bins
 
         if return_type == "dict":
             return_dict = {}
@@ -820,13 +1133,15 @@ class Loader:
                 offset += counts
             return return_dict, keys2idx
         elif return_type == "dataframe":
+            if len(active_bins_global) == 0:
+                return pd.DataFrame()
             # get only active rows from cl_array using active_bins_global
             df = pd.DataFrame(
                 cl_array[:, active_bins_global].T, columns=keys2idx.keys()
             )
-            df["species_richness"] = df.astype(bool).sum(axis=1)
-            df["start"] = df_dict["start"]
+            df["simultaneous_labels"] = df.astype(bool).sum(axis=1)
             df["end"] = df_dict["end"]
+            df["start"] = df_dict["start"]
             df["audiofilename"] = df_dict["audiofilename"]
             cols = list(df.columns)
             cols.reverse()
@@ -834,6 +1149,24 @@ class Loader:
             return df
 
     def get_annotations_parquet(self, preds_path=None, **kwargs):
+        """
+        Return all classifier predictions for the current model as a
+        dataframe, saving it as a CSV or parquet file if it has not been
+        saved yet (or if ``overwrite`` is True).
+
+        Parameters
+        ----------
+        preds_path : pathlib.Path, optional
+            path to the directory containing the prediction files, by
+            default None
+        **kwargs : dict
+            additional keyword arguments, including ``overwrite``
+
+        Returns
+        -------
+        pd.DataFrame
+            dataframe with one row per prediction time bin
+        """
         all_prediction_files, preds_path_local = (
             self.get_generated_annotation_files(preds_path=preds_path)
         )
@@ -858,12 +1191,16 @@ class Loader:
             )
             if isinstance(df, pd.DataFrame):
                 if len(df) * len(df.T) > 3_000_000:
-                    df.to_parquet(preds_path_local / (file_name + ".parquet"))
+                    df.to_parquet(
+                        preds_path_local / (file_name + ".parquet"), index=False
+                    )
                 else:
-                    df.to_csv(preds_path_local / (file_name + ".csv"))
+                    df.to_csv(
+                        preds_path_local / (file_name + ".csv"), index=False
+                    )
         else:
             try:
-                df = pd.read_csv(preds_path_local / (file_name + ".csv"))
+                df = pd.read_csv(preds_path_local / (file_name + ".csv"), index_col=False)
             except:
                 df = pd.read_parquet(
                     preds_path_local / (file_name + ".parquet")
@@ -891,6 +1228,11 @@ class Loader:
         ----------
         return_type : str, optional
             return either `array`, `dict` or `dataframe`, by default 'dict'
+        parent_dir : pathlib.Path, optional
+            name of the parent directory to load predictions from, by
+            default None
+        **kwargs : dict
+            additional keyword arguments
 
         Returns
         -------
@@ -945,6 +1287,21 @@ class Loader:
     def _write_audio_file_to_metadata(
         self, file, model, embeddings, file_length
     ):
+        """
+        Add the metadata entries (segment length, sample rate, embedding
+        size, per-file statistics) for a single processed audio file.
+
+        Parameters
+        ----------
+        file : pathlib.Path
+            path to the audio file
+        model : object
+            model object used to compute the embeddings
+        embeddings : np.ndarray
+            computed embeddings for the audio file
+        file_length : dict
+            dictionary mapping file stems to file lengths in seconds
+        """
         if (
             not "segment_length (samples)" in self.metadata_dict.keys()
             or not "sample_rate (Hz)" in self.metadata_dict.keys()
@@ -965,6 +1322,11 @@ class Loader:
         )
 
     def write_metadata_file(self):
+        """
+        Compute the total number of embeddings and the total dataset
+        length, sort the per-file metadata entries and write everything
+        to a ``metadata.yml`` file in the embedding directory.
+        """
         self.metadata_dict["nr_embeds_total"] = sum(
             self.metadata_dict["files"]["nr_embeds_per_file"]
         )
@@ -982,14 +1344,40 @@ class Loader:
             yaml.safe_dump(self.metadata_dict, f)
 
     def update_files(self):
+        """
+        Refresh ``self.files`` with the embedding files currently present
+        in ``self.embed_dir`` and restore ``self.embed_suffix`` to the
+        format this loader actually stores (``.json`` for dimensionality
+        reduction loaders, ``.npy`` otherwise).
+
+        The files are kept sorted so that the row order of the returned
+        embeddings is deterministic and matches the per-file bookkeeping
+        written to ``metadata.yml``.
+        """
         if self.dim_reduction_model:
             self.files = [
                 f for f in self.embed_dir.iterdir() if f.suffix == ".json"
             ]
+            self.embed_suffix = ".json"
         else:
             self.files = list(self.embed_dir.rglob("*.npy"))
+            self.embed_suffix = ".npy"
+        self.files.sort()
 
     def save_embedding_file(self, file, embeds):
+        """
+        Save computed embeddings for a single audio file to the embedding
+        directory. For dimensionality reduction models the embeddings are
+        stored as a JSON file including timestamps; otherwise they are
+        stored as a ``.npy`` file.
+
+        Parameters
+        ----------
+        file : pathlib.Path
+            path to the audio file the embeddings were computed from
+        embeds : np.ndarray
+            embeddings to save
+        """
         if self.dim_reduction_model:
             file_dest = self.embed_dir.joinpath(
                 self.audio_dir.stem + "_" + self.model_name
@@ -1017,10 +1405,24 @@ class Loader:
     def _save_embeddings_dict_with_timestamps(
         self, file_dest, embeds, input_len
     ):
+        """
+        Save reduced-dimension embeddings as a JSON file containing the
+        coordinate columns, per-embedding timestamps and metadata.
+
+        Parameters
+        ----------
+        file_dest : str
+            destination path for the JSON file
+        embeds : np.ndarray
+            reduced dimension embeddings
+        input_len : float
+            length of a single embedding segment in seconds
+        """
         t_stamps = []
+        keys =  ["x", "y", "z"]
         d = {
-            var: embeds[:, i].tolist()
-            for i, var in zip(range(embeds.shape[1]), ["x", "y"])
+            keys[i]: embeds[:, i].tolist()
+            for i in range(embeds.shape[1])
         }
 
         if self.only_embed_annotations:
@@ -1071,7 +1473,7 @@ class Loader:
         with open(file_dest, "w") as f:
             json.dump(d, f, indent=2)
 
-        if embeds.shape[-1] > 2:
+        if embeds.shape[-1] > 3:
             embed_dict = {}
             acc_shape = 0
             for shape, file in zip(
@@ -1094,6 +1496,29 @@ class Loader:
         paths=None,
         **kwargs,
     ):
+        """
+        Determine whether the pretrained classifier should be run for the
+        current model, based on whether classification outputs already
+        exist and on model-specific constraints.
+
+        Parameters
+        ----------
+        run_pretrained_classifier : bool, optional
+            whether a pretrained classifier should be run, by default False
+        testing : bool, optional
+            whether this is a testing run, by default False
+        paths : object, optional
+            object providing the paths for saving predictions, by default None
+        **kwargs : dict
+            additional keyword arguments
+
+        Returns
+        -------
+        bool
+            True if the classifier should be run, False otherwise
+        """
+        if not run_pretrained_classifier:
+            return False
         if not paths:
             if hasattr(self, "paths"):
                 paths = self.paths
@@ -1108,6 +1533,7 @@ class Loader:
             and run_pretrained_classifier
         ):
             if self.model_name in [
+                "birdnet_v3",
                 "perch_v2",
                 "perch_bird",
                 "vggish",
@@ -1157,6 +1583,22 @@ class Loader:
                 return True
 
     def get_generated_annotation_files(self, preds_path=None):
+        """
+        Return the names of all already generated annotation files for the
+        current model together with the directory containing them.
+
+        Parameters
+        ----------
+        preds_path : pathlib.Path, optional
+            path to the prediction files, by default None
+
+        Returns
+        -------
+        list
+            list of file stems of the generated annotation files
+        pathlib.Path
+            path to the directory containing the annotation files
+        """
         if not preds_path is None:
             preds_src_path = (
                 self.paths.preds_path
@@ -1169,6 +1611,23 @@ class Loader:
 
 
 def replace_default_kwargs_with_user_kwargs(remove_keys=None, **kwargs):
+    """
+    Merge the default bacpipe configuration and settings values with the
+    user-provided keyword arguments. User values override the defaults,
+    and any additional keyword arguments are added to the returned dict.
+
+    Parameters
+    ----------
+    remove_keys : list, optional
+        keys to remove from the default kwargs before merging, by default None
+    **kwargs : dict
+        user-provided keyword arguments
+
+    Returns
+    -------
+    dict
+        merged dictionary of default and user keyword arguments
+    """
     from bacpipe import config, settings
 
     default_kwargs = {**vars(config), **vars(settings)}
@@ -1186,3 +1645,42 @@ def replace_default_kwargs_with_user_kwargs(remove_keys=None, **kwargs):
     for k, v in kwargs.items():
         replaced_kwargs[k] = v
     return replaced_kwargs
+
+
+
+def return_reduced_dimensions(directory):
+    """
+    Return the integer number of dimensions in the 
+    reduced embeddings. This is done by only looking
+    for the keys of the json file, thereby loading 
+    times should be kept minimal. If the key "z" is 
+    found, it indicates that the embeddings have been
+    reduced to 3 dimensions. If not, they have been 
+    reduced to 2 dimensions. 
+
+    Parameters
+    ----------
+    directory : pathlib.Path object
+        path to reduced dimensionality embeddings
+
+    Returns
+    -------
+    int
+        2 or 3 depending on if z is in the json or not
+    """
+    umap_dims = 2
+    import ijson
+    try:
+        file = list(directory.glob('*.json'))[0]
+        with open(file, "rb") as f:
+            parser = ijson.parse(f)
+
+            for prefix, _, _ in parser:
+                if prefix == "z":
+                    umap_dims = 3
+                    break
+    except Exception as e:
+        logger.warning(
+            "Couldn't find out umap dimensions of saved files."
+        )
+    return umap_dims

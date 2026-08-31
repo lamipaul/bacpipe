@@ -171,6 +171,13 @@ def load_results(path_func, task, model_list):
             key = "clust_path"
         elif task == "probing":
             key = "probe_path"
+        else:
+            error_str = (
+                f"The {task=} is not a known evaluation task by bacpipe "
+                "and can't be executed."
+            )
+            logger.exception(error_str)
+            raise NameError(error_str)
         for file in getattr(paths, key).rglob("*results*.json"):
             if task == "probing":
                 subtask = file.stem.split("_")[-1]
@@ -182,7 +189,9 @@ def load_results(path_func, task, model_list):
     return results
 
 
-def plot_per_class_results(plot_path, task_name, model_list, results):
+def plot_per_class_results(
+    plot_path, task_name, model_list, results=None, path_func=None, return_fig=False
+):
     """
     Visualization of per class results. Resulting figure is stored in
     plot path. Models are sorted by the value of the first entry.
@@ -195,15 +204,47 @@ def plot_per_class_results(plot_path, task_name, model_list, results):
         name of task
     model_list : list
         list of models
-    results : dict
-        performance dictionary
+    results : dict, optional
+        performance dictionary. When omitted, the per-model
+        ``probe_results_*.json`` files are loaded from disk via ``path_func``.
+    path_func : callable, optional
+        function that returns the model paths when given a model name,
+        used to load results when ``results`` is not provided.
+    return_fig : bool, optional
+        whether to return the figure instead of saving it, by default False
     """
+    if not results:
+        results = load_results(path_func, "probing", model_list)
+        if not results:
+            logger.warning(
+                "\nNo probing result files were found. Perhaps probing was not "
+                "computed for the selected models, or you are only computing one "
+                "model and that is the reason no comparison plot is created."
+            )
+            return {}
+        subtask = task_name.split(" ")[0]
+        results = {
+            k.split("(")[0]: v for k, v in results.items() if subtask in k
+        }
+    if not results:
+        return {}
     per_class_results = {
         m: v["per_class_accuracy"] for m, v in results.items()
     }
     overall_results = {m: v["overall"] for m, v in results.items()}
+    model_list = [m for m in model_list if m in per_class_results]
+    if not model_list:
+        return {}
     num_classes = len(per_class_results[model_list[0]].keys())
-    fig_width = max(12, num_classes * 0.5)
+    if return_fig:
+        # Rendered inside the dashboard's Panel accordion, which scales the
+        # figure to the available width. Keep the natural width modest so the
+        # embedded figure stays legible; ``num_classes * 0.5`` explodes for
+        # datasets with hundreds of classes and pushed the plot outside the
+        # accordion.
+        fig_width = 12
+    else:
+        fig_width = max(12, num_classes * 0.5)
     fig, ax = plt.subplots(1, 1, figsize=(fig_width, 8))
 
     cmap = plt.cm.tab10
@@ -211,10 +252,17 @@ def plot_per_class_results(plot_path, task_name, model_list, results):
 
     d = {m: v["macro_accuracy"] for m, v in overall_results.items()}
     model_list = sorted(d, key=d.get, reverse=True)
-    all_classes = sorted(per_class_results[model_list[0]].keys())
+
+    # Use one consistent class order for every model: the reference (best)
+    # model's classes sorted by accuracy descending. This keeps the x-axis
+    # labels aligned with the plotted values and matches the per-model probe
+    # plots, which also sort classes by accuracy.
+    reference = per_class_results[model_list[0]]
+    all_classes = sorted(reference, key=reference.get, reverse=True)
 
     for i, model_name in enumerate(model_list):
-        class_values = per_class_results[model_name].values()
+        all_found_classes =  [cls for cls in all_classes if cls in list(per_class_results[model_name].keys())]
+        class_values = [per_class_results[model_name][cls] for cls in all_found_classes]
 
         ax.scatter(
             np.arange(len(class_values)),
@@ -239,14 +287,16 @@ def plot_per_class_results(plot_path, task_name, model_list, results):
     )
     ax.set_ylabel("Accuracy")
     ax.set_xlabel("Classes")
-    ax.set_xticks(np.arange(len(all_classes)))
-    ax.set_xticklabels(all_classes, rotation=90)
+    ax.set_xticks(np.arange(len(all_found_classes)))
+    ax.set_xticklabels(all_found_classes, rotation=90)
 
     ax.legend(
         loc="upper left", bbox_to_anchor=(1.05, 1), title="Models", fontsize=10
     )
 
     fig.subplots_adjust(right=0.65, bottom=0.3)
+    if return_fig:
+        return fig
     file_name = (
         f"comparison_{task_name.replace(' ', '_')}_"
         + "-".join([m[:2] for m in model_list])
@@ -276,57 +326,74 @@ def plot_classification_heatmap(
     species=None,
     **kwargs,
 ):
+    """
+    Generate a presence heatmap for a species across time and hours.
+
+    Parameters
+    ----------
+    event : object or None
+        widget event triggering the update
+    predictions_loader : PredictionsLoader object
+        loader providing the binary presence data
+    model : str
+        name of the model
+    accumulate_by : str
+        time unit used to aggregate ("day", "week", or "month")
+    threshold : float or str
+        detection threshold
+    species : str or None
+        species to plot, by default None
+    **kwargs
+        additional keyword arguments (e.g., heatmap_fig_height)
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        presence heatmap figure
+    """
     if event is None and species is None:
         return SpectrogramPlot.dummy_image(
             title="Click the button to generate a prediction heatmap."
         )
     try:
         predictions_loader.get_data(model, threshold, **kwargs)
+        accumulated_presence = predictions_loader.accumulate_data(
+            species, accumulate_by
+        )
     except Exception as e:
         logger.exception(e)
-        # TODO thid doesn't update the plot for some reason
         return SpectrogramPlot.dummy_image(title=str(e))
-    # if predictions_loader.binary_presence is None:
-    #     return predictions_loader.failed_fig
-    accumulated_presence = predictions_loader.accumulate_data(
-        species, accumulate_by
-    )
-    timestamps = predictions_loader.timestamps
-
     logger.info("Redrawing heatmap plot")
+
+    # Effective species (``None``/unknown names fall back to "overall").
+    effective_species = species if species else "overall"
+    if effective_species not in predictions_loader.class_dict:
+        effective_species = "overall"
+    is_overall = effective_species == "overall"
 
     # Prepare data - mask values below 0
     plot_data = accumulated_presence.T.copy()
     plot_data = np.where(plot_data < 0, np.nan, plot_data)
 
-    # Get time labels based on accumulation type
+    # Time bin labels, in the same sorted order as the accumulated heatmap
+    # rows (``np.unique`` inside ``transform_presence_into_hour_heatmap``), so
+    # y-axis ticks and hover labels always line up with the plotted cells.
+    unique_labels = predictions_loader.get_time_bin_labels(accumulate_by)
+
+    # Get axis label based on accumulation type
     if accumulate_by == "day":
-        y_labels = [str(ts.date()) for ts in timestamps]
-        y_axis_label = "Dates"
+        y_axis_label = "Date"
     elif accumulate_by == "month":
-        y_labels = [f"{date.year}-{date.month}" for date in timestamps]
         y_axis_label = "Months"
     elif accumulate_by == "week":
-        y_labels = [
-            f"{date.year}-W{date.isocalendar().week}" for date in timestamps
-        ]
         y_axis_label = "Weeks"
 
     # Hour labels (0-23)
     x_labels = list(range(24))
-
-    # Get unique labels (preserving order)
-    unique_labels = []
-    seen = set()
-    for label in y_labels:
-        if label not in seen:
-            unique_labels.append(label)
-            seen.add(label)
     y_indices = list(range(len(unique_labels)))
-    if len(y_indices) > len(y_indices) / int(
-        kwargs.get("heatmap_fig_height") / 100
-    ):
-        nr_y_ticks = int(kwargs.get("heatmap_fig_height") / 100)
+    nr_y_ticks = max(
+        1, int(kwargs.get("heatmap_fig_height", 600) / 100)
+    )
 
     clfier_type = (
         f"{predictions_loader.current_clfier_type} probing"
@@ -348,7 +415,7 @@ def plot_classification_heatmap(
         title=(
             f"Presence heatmap using {model.upper()} with "
             f"{clfier_type} <br>"
-            f"for {species} "
+            f"for {effective_species} "
             f"with threshold of {PredictionsLoader.verify_threshold(threshold)}."
         ),
     )
@@ -391,20 +458,50 @@ def plot_classification_heatmap(
         margin=dict(r=100),
     )
 
-    # Make NaN values appear white
+    # Make NaN values appear white and attach per-cell hover data. The date is
+    # always shown via ``customdata`` so the hover never shows the raw integer
+    # row index. For the overall view, additionally list the top classes.
+    n_bins = len(unique_labels)
+    if is_overall:
+        top_classes_hover = predictions_loader.overall_hover_text(accumulate_by)
+    else:
+        top_classes_hover = None
+
+    if top_classes_hover is not None:
+        customdata = np.empty((n_bins, 24, 2), dtype=object)
+        for i in range(n_bins):
+            for j in range(24):
+                customdata[i, j, 0] = unique_labels[i]
+                customdata[i, j, 1] = top_classes_hover[i, j]
+        hovertemplate = (
+            "Hour: %{x}<br>"
+            + y_axis_label
+            + ": %{customdata[0]}<br>Presence: %{z}<br>"
+            + "Top classes:<br>%{customdata[1]}<extra></extra>"
+        )
+    else:
+        customdata = np.empty((n_bins, 24, 1), dtype=object)
+        customdata[:, :, 0] = np.array(unique_labels, dtype=object)[:, None]
+        hovertemplate = (
+            "Hour: %{x}<br>"
+            + y_axis_label
+            + ": %{customdata[0]}<br>Presence: %{z}<extra></extra>"
+        )
+
     fig.update_traces(
-        hovertemplate="Hour: %{x}<br>"
-        + y_axis_label
-        + ": %{y}<br>Presence: %{z}<extra></extra>",
-        customdata=np.array(unique_labels)[
-            :, None
-        ],  # Add date labels to hover
+        hovertemplate=hovertemplate,
+        customdata=customdata,
     )
 
     return fig
 
 
 class PredictionsLoader:
+    """
+    Load and cache binary presence data, ground truth and classifier
+    predictions for the predictions pages.
+    """
+
     def __init__(
         self,
         vis_loader,
@@ -415,6 +512,26 @@ class PredictionsLoader:
         loading_pane,
         thresh=0.5,
     ):
+        """
+        Initialize the predictions loader.
+
+        Parameters
+        ----------
+        vis_loader : EmbedAndLabelLoader object
+            loader providing the embeddings
+        path_func : function
+            function returning the paths for a given model
+        models : list
+            list of models
+        panel_selection : object
+            dropdown widget for selecting the species
+        progress_bar : object
+            progress bar widget
+        loading_pane : object
+            pane widget for status messages
+        thresh : float
+            default detection threshold
+        """
         self.vis_loader = vis_loader
         self.path_func = path_func
         self.models = models
@@ -426,98 +543,160 @@ class PredictionsLoader:
     def get_data(
         self, model, threshold, clfier_type=None, probe_path="", **kwargs
     ):
+        """
+        Load or recompute the binary presence data for a model.
+
+        Parameters
+        ----------
+        model : str
+            name of the model
+        threshold : float or str
+            detection threshold
+        clfier_type : str or None
+            type of classifier ("Linear", "Integrated", or None)
+        probe_path : str
+            path to the probe used for the linear classifier
+        **kwargs
+            additional keyword arguments (unused)
+
+        Returns
+        -------
+        None
+            results are cached on the instance
+        """
         threshold = self.verify_threshold(threshold)
-        if hasattr(self, "binary_presence"):
-            if all(
-                [
-                    self.current_model == model,
-                    self.current_threshold == threshold,
-                    not self.class_dict is None,
-                    (
-                        self.current_clfier_type == clfier_type
-                        or clfier_type is None
-                    ),
-                ]
-            ):
-                return
 
-        self.current_model = model
-        self.current_threshold = threshold
-        self.current_clfier_type = clfier_type
-
+        # If no trained probe exists, fall back to the integrated classifier.
+        if clfier_type is None:
+            clfier_type = getattr(self, "current_clfier_type", "Integrated")
         if not (
             self.path_func(self.models[0]).probe_path / "linear_probe.pt"
         ).exists():
+            logger.warning(
+                "\nNo Linear probe has been trained yet, therefore Linear is not "
+                "an option. Enable probing to ensure a linear classifier is saved "
+                "first. Then it can be used here.\n"
+            )
             clfier_type = "Integrated"
 
-        if clfier_type == "Linear":
-            self.loading_pane.value = "Loading embeddings for classification"
-            linear_probe, self.class_dict = prepare_probe_inference(
-                model, probe_path
+        # Serve the cached result only if it matches the current request and
+        # is fully consistent. A failed run must not leave a stale cache
+        # behind, which is why the "overall" column is part of the check
+        # (it is only added after a fully successful load).
+        if hasattr(self, "binary_presence") and (
+            hasattr(self, 'current_model')
+            and self.current_model == model
+            and self.current_threshold == threshold
+            and self.current_clfier_type == clfier_type
+            and self.class_dict is not None
+            and "overall" in self.class_dict
+        ):
+            return
+
+        # Only touch the cached state after everything succeeded so that a
+        # failed run cannot leave stale/inconsistent data in the cache.
+        try:
+            if clfier_type == "Linear":
+                self.loading_pane.value = "Loading embeddings for classification"
+                if not probe_path:
+                    probe_path = self.path_func(model).probe_path / "linear_probe.pt"
+                linear_probe, class_dict = prepare_probe_inference(
+                    model, probe_path, **kwargs
+                )
+                self.loading_pane.value = "Running linear probe"
+                threshold = self.verify_threshold(threshold)
+
+                binary_presence = run_probe_inference(
+                    model,
+                    linear_probe,
+                    threshold,
+                    return_binary_presence=True,
+                    callbacks={"progress_bar": self.progress_bar},
+                    audio_dir=self.path_func(model).audio_dir,
+                    main_results_dir=self.path_func(model).main_results_dir,
+                    **kwargs,
+                )
+
+            elif clfier_type == "Integrated":
+                self.loading_pane.name = "Preparing heatmap"
+                self.loading_pane.value = "Loading precomputed embeddings"
+                binary_presence, class_dict = self.load_classification(
+                    model, threshold
+                )
+
+            else:
+                raise ValueError(
+                    f"\nUnknown classifier type: {clfier_type!r}\n"
+                )
+
+            self.embed_dict = self.vis_loader.embeds[model]
+
+            if binary_presence is None:
+                warning_string = (
+                    "\nIt seems like the classifier hasn't been run yet, or <br>"
+                    f"that {model} doesn't have a pretrained classifier. <br>"
+                    "If the model has a pretrained classifier, please rerun <br>"
+                    "bacpipe with the setting `run default classifier` set to `True`.\n"
+                )
+                self.loading_pane.value = warning_string
+                raise FileNotFoundError(warning_string)
+
+            if not len(self.embed_dict["x"]) == len(binary_presence):
+                logger.warning(
+                    "\nThere is a mismatch between the number of embeddings "
+                    "and the number of predictions. Going to zero pad the "
+                    "rest, but this could misalign things. \n"
+                )
+                binary_presence = np.pad(
+                    binary_presence,
+                    (
+                        (0, len(self.embed_dict["x"]) - len(binary_presence)),
+                        (0, 0),
+                    ),
+                    "constant",
+                )
+
+            self.get_timestamps_per_embedding(model)
+
+            class_dict["overall"] = len(class_dict)
+            binary_presence = np.concatenate(
+                [
+                    binary_presence.T,
+                    [np.sum(binary_presence, axis=1)],
+                ]
+            ).T
+
+            class_dict = self.reorder_by_most_occurrance(
+                binary_presence, class_dict
             )
-            self.loading_pane.value = "Running linear probe"
-            threshold = self.verify_threshold(threshold)
+        except Exception:
+            self.binary_presence = None
+            self.class_dict = None
+            raise
 
-            self.binary_presence = run_probe_inference(
-                model,
-                linear_probe,
-                threshold,
-                return_binary_presence=True,
-                callbacks={"progress_bar": self.progress_bar},
-            )
-
-        elif clfier_type == "Integrated":
-            self.loading_pane.name = "Preparing heatmap"
-            self.loading_pane.value = "Loading precomputed embeddings"
-            self.binary_presence, self.class_dict = self.load_classification(
-                model, threshold
-            )
-
-        self.embed_dict = self.vis_loader.embeds[model]
-
-        if self.binary_presence is None:
-            warning_string = (
-                "It seems like the classifier hasn't been run yet, or <br>"
-                f"that {model} doesn't have a pretrained classifier. <br>"
-                "If the model has a pretrained classifier, please rerun <br>"
-                "bacpipe with the setting `run default classifier` set to `True`."
-            )
-            self.loading_pane.value = warning_string
-            raise FileNotFoundError(warning_string)
-
-        if not len(self.embed_dict["x"]) == len(self.binary_presence):
-            logger.warning(
-                "There is a mismatch between the number of embeddings "
-                "and the number of predictions. Going to zero pad the "
-                "rest, but this could misalign things. "
-            )
-            self.binary_presence = np.pad(
-                self.binary_presence,
-                (
-                    (0, len(self.embed_dict["x"]) - len(self.binary_presence)),
-                    (0, 0),
-                ),
-                "constant",
-            )
-
-        self.get_timestamps_per_embedding(model)
-
-        self.class_dict["overall"] = len(self.class_dict)
-        self.binary_presence = np.concatenate(
-            [
-                self.binary_presence.T,
-                [np.sum(self.binary_presence, axis=1).astype(np.int8)],
-            ]
-        ).T
-
-        self.class_dict = self.reorder_by_most_occurrance(
-            self.binary_presence, self.class_dict
-        )
-
+        # Commit to the cache only on success.
+        self.binary_presence = binary_presence
+        self.class_dict = class_dict
+        self.current_model = model
+        self.current_threshold = threshold
+        self.current_clfier_type = clfier_type
         self.panel_selection.options = list(self.class_dict.keys())
 
     @staticmethod
     def verify_threshold(threshold):
+        """
+        Normalize a threshold widget value to a float.
+
+        Parameters
+        ----------
+        threshold : float or str
+            raw threshold value, possibly an empty string
+
+        Returns
+        -------
+        float
+            validated threshold
+        """
         if threshold == "":
             threshold = 0.5
         else:
@@ -526,6 +705,21 @@ class PredictionsLoader:
 
     @staticmethod
     def reorder_by_most_occurrance(probs, label2index):
+        """
+        Reorder the class index mapping by total occurrence count.
+
+        Parameters
+        ----------
+        probs : np.ndarray
+            binary presence array of shape (n_embeddings, n_classes)
+        label2index : dict
+            mapping of class name to column index
+
+        Returns
+        -------
+        dict
+            class to index mapping sorted by decreasing occurrence
+        """
         sums = [sum(probs[:, a]) for a in range(probs.shape[1])]
 
         sorted_l2i = dict(
@@ -534,6 +728,19 @@ class PredictionsLoader:
         return sorted_l2i
 
     def get_classes(self, path):
+        """
+        Load the class names from a probe's label2index file.
+
+        Parameters
+        ----------
+        path : str or pathlib.Path
+            path to the probe file
+
+        Returns
+        -------
+        list
+            class names, or an empty list if no probe exists
+        """
         if path == "":
             path = (
                 self.path_func(self.models[0]).probe_path / "linear_probe.pt"
@@ -546,6 +753,22 @@ class PredictionsLoader:
             return []
 
     def load_classification(self, model, threshold):
+        """
+        Load the integrated classifier outputs as binary presence data.
+
+        Parameters
+        ----------
+        model : str
+            name of the model
+        threshold : float
+            detection threshold applied to the class probabilities
+
+        Returns
+        -------
+        tuple of (np.ndarray or None, dict or None)
+            binary presence array and class to index mapping, or
+            (None, None) if no classifier outputs exist
+        """
         integrated_clfier_path = self.path_func(model).preds_path.joinpath(
             "original_classifier_outputs"
         )
@@ -589,6 +812,21 @@ class PredictionsLoader:
 
                     total_length += current_time_bins
                 self.progress_bar.value = int((idx + 1) / len(files) * 100)
+            if len(keys2idx) == 0:
+                error_string = (
+                    "\nNo predictions have been found in the provdided data "
+                    "using this model. Please try again with a different "
+                    "threshold or different model. \n"
+                    "Simply changing the threshold will not change this, "
+                    "given that there were no predictions with the minimum "
+                    "threshold, the classifications need to be recomputed. "
+                    "The easiest way to do this is to delete the generated "
+                    "classifications which will force a recomputation.\n"
+                )
+                logger.exception(error_string)
+                raise ValueError(
+                    error_string
+                )
             import pandas as pd
 
             probs_array = np.array(list(cl_dict.values())).T
@@ -610,7 +848,29 @@ class PredictionsLoader:
         return binary_classification, keys2idx
 
     def accumulate_data(self, species, accumulate_by="day"):
+        """
+        Accumulate the binary presence of a species into a time heatmap.
+
+        Parameters
+        ----------
+        species : str or None
+            species to accumulate, or None for the overall presence
+        accumulate_by : str
+            time unit used to aggregate ("day", "week", or "month")
+
+        Returns
+        -------
+        np.ndarray
+            accumulated presence array of shape (24, n_time_bins)
+        """
         if not species:
+            species = "overall"
+        # Fall back to the overall presence instead of crashing.
+        if species not in self.class_dict:
+            logger.warning(
+                f"\nSpecies {species!r} not found in the current classifier "
+                "outputs, falling back to 'overall'.\n"
+            )
             species = "overall"
         self.panel_selection.value = species
         species_idx = self.class_dict[species]
@@ -618,31 +878,134 @@ class PredictionsLoader:
 
         dates = np.array([ts.date() for ts in self.timestamps])
         hours = np.array([ts.hour for ts in self.timestamps])
-        if accumulate_by == "day":
-            date_tuple = [(d.year, d.month, d.day) for d in dates]
-            accumulated = self.transform_presence_into_hour_heatmap(
-                species_presence, hours, accumulator=date_tuple
-            )
-        elif accumulate_by == "week":
-            week_tuple = [
-                (date.year, date.isocalendar().week) for date in dates
-            ]
-            accumulated = self.transform_presence_into_hour_heatmap(
-                species_presence, hours, accumulator=week_tuple
-            )
-        elif accumulate_by == "month":
-            month_tuple = [(date.year, date.month) for date in dates]
-            accumulated = self.transform_presence_into_hour_heatmap(
-                species_presence, hours, accumulator=month_tuple
-            )
+        accumulator = self._get_time_accumulator(dates, accumulate_by)
+        accumulated = self.transform_presence_into_hour_heatmap(
+            species_presence, hours, accumulator=accumulator
+        )
         return accumulated
+
+    @staticmethod
+    def _get_time_accumulator(dates, accumulate_by):
+        """
+        Build the per-embedding time bin tuple used to aggregate the heatmap.
+
+        Parameters
+        ----------
+        dates : np.ndarray
+            ``datetime.date`` per embedding
+        accumulate_by : str
+            time unit used to aggregate (\"day\", \"week\", or \"month\")
+
+        Returns
+        -------
+        list of tuples
+            one time bin tuple per embedding
+        """
+        if accumulate_by == "day":
+            return [(d.year, d.month, d.day) for d in dates]
+        elif accumulate_by == "week":
+            return [(d.year, d.isocalendar().week) for d in dates]
+        elif accumulate_by == "month":
+            return [(d.year, d.month) for d in dates]
+        raise ValueError(f"Unknown accumulate_by value: {accumulate_by!r}")
+
+    def get_time_bin_labels(self, accumulate_by="day"):
+        """
+        Return the time bin labels in the same (sorted) order used by
+        ``transform_presence_into_hour_heatmap``.
+
+        Parameters
+        ----------
+        accumulate_by : str
+            time unit used to aggregate (\"day\", \"week\", or \"month\")
+
+        Returns
+        -------
+        list of str
+            one label per heatmap row (time bin)
+        """
+        dates = np.array([ts.date() for ts in self.timestamps])
+        accumulator = self._get_time_accumulator(dates, accumulate_by)
+        unique = np.unique(accumulator, axis=0)
+        labels = []
+        for item in unique:
+            if accumulate_by == "day":
+                labels.append(f"{item[0]:04d}-{item[1]:02d}-{item[2]:02d}")
+            elif accumulate_by == "week":
+                labels.append(f"{item[0]}-W{item[1]}")
+            elif accumulate_by == "month":
+                labels.append(f"{item[0]}-{item[1]}")
+        return labels
+
+    def overall_hover_text(self, accumulate_by="day", top_n=20):
+        """
+        Build per-cell hover text for the overall heatmap listing the top
+        classes (and their occurrence counts) for each time bin and hour.
+
+        Parameters
+        ----------
+        accumulate_by : str
+            time unit used to aggregate (\"day\", \"week\", or \"month\")
+        top_n : int
+            number of top classes to include in the hover text
+
+        Returns
+        -------
+        np.ndarray or None
+            object array of shape (n_time_bins, 24) with one hover string per
+            cell, or ``None`` when no overall column is available
+        """
+        if "overall" not in self.class_dict:
+            return None
+        class_names = [k for k in self.class_dict if k != "overall"]
+        dates = np.array([ts.date() for ts in self.timestamps])
+        hours = np.array([ts.hour for ts in self.timestamps])
+        accumulator = self._get_time_accumulator(dates, accumulate_by)
+        unique = np.unique(accumulator, axis=0)
+        n_bins = len(unique)
+        hover = np.empty((n_bins, 24), dtype=object)
+        for acc_idx, item in enumerate(unique):
+            bin_idx = np.where(np.all(accumulator == item, axis=1))[0]
+            for hour in range(24):
+                hour_idx = np.where(hours[bin_idx] == hour)[0]
+                if len(hour_idx) == 0:
+                    hover[acc_idx, hour] = ""
+                    continue
+                idx = bin_idx[hour_idx]
+                counts = [
+                    (name, int(self.binary_presence[idx, self.class_dict[name]].sum()))
+                    for name in class_names
+                ]
+                counts = [(n, c) for n, c in counts if c > 0]
+                counts.sort(key=lambda x: x[1], reverse=True)
+                hover[acc_idx, hour] = "<br>".join(
+                    f"{n}: {c}" for n, c in counts[:top_n]
+                )
+        return hover
 
     @staticmethod
     def transform_presence_into_hour_heatmap(
         species_presence, hours, accumulator
     ):
+        """
+        Transform per-embedding presence into a 24-hour by time-bin matrix.
+
+        Parameters
+        ----------
+        species_presence : np.ndarray
+            binary presence per embedding
+        hours : np.ndarray
+            hour of day for each embedding
+        accumulator : list of tuples
+            time bin label (e.g., (year, month, day)) for each embedding
+
+        Returns
+        -------
+        np.ndarray
+            heatmap of shape (24, n_time_bins) with -1 for empty bins
+        """
         accumulated = (
-            np.ones([24, len(np.unique(accumulator, axis=0))], dtype=np.int8)
+            np.ones([24, len(np.unique(accumulator, axis=0))], dtype=np.int64)
             * -1
         )
         for acc_idx, item in enumerate(np.unique(accumulator, axis=0)):
@@ -665,6 +1028,19 @@ class PredictionsLoader:
         return accumulated
 
     def get_timestamps_per_embedding(self, model):
+        """
+        Compute a datetime timestamp for each embedding.
+
+        Parameters
+        ----------
+        model : str
+            name of the model
+
+        Returns
+        -------
+        None
+            timestamps are stored on the instance
+        """
         from bacpipe.embedding_evaluation.label_embeddings import (
             get_dt_filename,
         )

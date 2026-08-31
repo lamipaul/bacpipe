@@ -4,28 +4,76 @@ import re
 import logging
 from pathlib import Path
 import pandas as pd
+import importlib.resources as pkg_resources
 
 logger = logging.getLogger("bacpipe")
 from sklearn.metrics import classification_report, average_precision_score
 
     
 def clean_string(s):
+    """
+    Clean a string by removing hyphens and whitespace and lowercasing it.
+
+    Parameters
+    ----------
+    s : str
+        string to be cleaned
+
+    Returns
+    -------
+    str
+        cleaned string
+    """
     return re.sub(r"[-\s]", "", s).lower()
 
 
 def normalize_name(s):
+    """
+    Normalize a name by lowercasing it, standardizing grey to gray and
+    removing all non-alphanumeric characters.
+
+    Parameters
+    ----------
+    s : str
+        name to be normalized
+
+    Returns
+    -------
+    str
+        normalized name
+    """
     # Lowercase, standardize grey -> gray, and remove ALL non-alphanumeric chars
     # Handles hyphens, spaces, slashes (/), apostrophes, etc.
     s = s.lower().replace("grey", "gray")
     return re.sub(r"[^a-z0-9]", "", s)
 
 def associate_labels_to_eBird_Codes(gt_species_cols, gt_without_metadata):
+    """
+    Attempt to convert annotated species labels that are eBird Codes to
+    their corresponding common names and update the ground truth dataframe
+    accordingly.
+
+    Parameters
+    ----------
+    gt_species_cols : np.array
+        array with the ground truth species column names
+    gt_without_metadata : pandas.DataFrame
+        ground truth dataframe without the metadata columns
+
+    Returns
+    -------
+    np.array
+        array with the ground truth species column names, updated with
+        the common names where eBird Codes were found
+    pandas.DataFrame
+        ground truth dataframe with the renamed species columns
+    """
     logger.info(
         "\nNo species found on first attempt, therefore trying to see if "
         "annotated species are eBird Codes and converting them to common name."
     )
     # check if in eBird Codes
-    ebird_path = Path('bacpipe/embedding_evaluation/eBird_taxonomy_v2025-4.csv')
+    ebird_path = Path(pkg_resources.files('bacpipe') / 'embedding_evaluation/eBird_taxonomy_v2025-4.csv')
     ebird_df = pd.read_csv(ebird_path)
     gt_ebird2common = {}
     for idx, gt_label in enumerate(gt_species_cols):
@@ -54,6 +102,26 @@ def associate_labels_to_eBird_Codes(gt_species_cols, gt_without_metadata):
 def associate_labels_regardless_of_puctuation(
     label2idx, gt_without_metadata, found, not_found
     ):
+    """
+    Try to match ground truth labels that were not found by removing
+    hyphens, spaces and punctuation from the labels.
+
+    Parameters
+    ----------
+    label2idx : dict
+        dictionary mapping the prediction labels to their indices
+    gt_without_metadata : pandas.DataFrame
+        ground truth dataframe without the metadata columns
+    found : list
+        list of ground truth labels that were already matched
+    not_found : list
+        list of ground truth labels that were not matched yet
+
+    Returns
+    -------
+    pandas.DataFrame
+        ground truth dataframe with renamed species columns
+    """
     logger.info(
         f"\nSpecies found in ground truth but NOT exactly in predictions: {not_found}"
     )
@@ -85,6 +153,26 @@ def associate_labels_regardless_of_spelling_and_substrings(
     gt_without_metadata,
     not_found
     ):
+    """
+    Try to match ground truth labels that were not found using flexible
+    matching of normalized names and unique substrings.
+
+    Parameters
+    ----------
+    label2idx : dict
+        dictionary mapping the prediction labels to their indices
+    found : list
+        list of ground truth labels that were already matched
+    gt_without_metadata : pandas.DataFrame
+        ground truth dataframe without the metadata columns
+    not_found : list
+        list of ground truth labels that were not matched yet
+
+    Returns
+    -------
+    pandas.DataFrame
+        ground truth dataframe with renamed species columns
+    """
     logger.info(
         f"\nNext try: Flexible matching (grey/gray, slashes, and unique substrings) for: {not_found}"
     )
@@ -156,6 +244,31 @@ def associate_ground_truth_and_prediction_labels(
     label2idx, 
     gt_without_metadata
     ):
+    """
+    Associate the ground truth species labels with the prediction labels
+    by applying several matching strategies and return an aligned ground
+    truth matrix.
+
+    Parameters
+    ----------
+    gt_species_cols : np.array
+        array with the ground truth species column names
+    label2idx : dict
+        dictionary mapping the prediction labels to their indices
+    gt_without_metadata : pandas.DataFrame
+        ground truth dataframe without the metadata columns
+
+    Returns
+    -------
+    pandas.DataFrame
+        ground truth dataframe aligned to the prediction columns
+    list
+        shared labels between ground truth and predictions
+    list
+        indices of the shared labels in the predictions
+    list
+        species that were not found in the classifier class list
+    """
     # Find exact matching classes
     found = [label for label in gt_species_cols if label in label2idx]
     not_found = [label for label in gt_species_cols if label not in label2idx]
@@ -244,6 +357,19 @@ def benchmark(
     This function expects a threshold. Threshold-independent
     performance evaluation is currently not supported.
 
+    Examples::
+    
+        # Benchmark the ``birdnet`` classifier on the test data using the
+        # saved predictions:
+
+        report = bacpipe.benchmark(
+            model='birdnet',
+            dataset='bacpipe/tests/test_data',
+            annotations_file='annotations.csv',
+            overwrite=False,
+        )
+        report['report']
+
     Parameters
     ----------
     model : string
@@ -275,7 +401,7 @@ def benchmark(
         of the species that weren't found in the classifier
         class list
     """
-    model = bacpipe.confirm_model_name(model)
+    model = bacpipe.confirm_model_name(model, **kwargs)
     logger.info("Fetching ground truth and mapping it to model timestamps.\n")
     gt = bacpipe.ground_truth_by_model(
         model,
@@ -288,10 +414,10 @@ def benchmark(
 
     # Isolate species columns from metadata
     non_species_labels = [
-        "starts",
-        "ends",
+        "start",
+        "end",
         "audiofilename",
-        "species_richness",
+        "simultaneous_labels",
     ]
     gt_species_cols = [
         col for col in gt.columns if col not in non_species_labels
@@ -340,20 +466,41 @@ def benchmark(
     logger.info(f"Annotated timestamps: {annotated_mask.sum()} of {len(preds)}")
 
     # --- Performance Evaluation ---
-    report = classification_report(
-        gt_binary,
-        pred_binary,
-        target_names=shared_labels,
-        zero_division=0,
-        output_dict=True,
-    )
-
-    logger.info("\n--- Overall Report ---")
-    logger.info(
-        classification_report(
+    # scikit-learn treats a single-column binary matrix as a plain binary
+    # (presence/absence) problem rather than a multilabel indicator, which
+    # crashes ``classification_report`` with "Number of classes, 2, does not
+    # match size of target_names, 1". Flatten the single-class case and report
+    # on the "present" class (label 1) so the metrics stay correct.
+    if len(shared_labels) == 1:
+        report = classification_report(
+            gt_binary.ravel(),
+            pred_binary.ravel(),
+            labels=[1],
+            target_names=shared_labels,
+            zero_division=0,
+            output_dict=True,
+        )
+        report_str = classification_report(
+            gt_binary.ravel(),
+            pred_binary.ravel(),
+            labels=[1],
+            target_names=shared_labels,
+            zero_division=0,
+        )
+    else:
+        report = classification_report(
+            gt_binary,
+            pred_binary,
+            target_names=shared_labels,
+            zero_division=0,
+            output_dict=True,
+        )
+        report_str = classification_report(
             gt_binary, pred_binary, target_names=shared_labels, zero_division=0
         )
-    )
+
+    logger.info("\n--- Overall Report ---")
+    logger.info(report_str)
     map_score = average_precision_score(
         gt_binary, 
         preds[:, shared_indices][annotated_mask, :], 

@@ -18,6 +18,9 @@ BEATS_PRETRAINED_PATH_NATURELM = "naturebeats/naturebeats.pt"
 
 class Model(ModelBaseClass):
     def __init__(self, **kwargs):
+        """
+        Initialize the NatureBeats model.
+        """
         super().__init__(
             sr=SAMPLE_RATE, segment_length=LENGTH_IN_SAMPLES, **kwargs
         )
@@ -39,10 +42,40 @@ class Model(ModelBaseClass):
         self.beats.model.load_state_dict(beats_ckpt_naturelm, strict=True)
         self.beats.model.eval()
         self.beats.model.to(self.device)
+        
+        self.model = self.beats.model
+        self.model.preprocess_audio = self.beats.process_audio_beats
+        self.model.return_embeddings = self.beats.get_embeddings
 
     def preprocess(self, audio):
+        """
+        Clamp the audio samples and convert them with the BEATs preprocessing.
+
+        Parameters
+        ----------
+        audio : torch.Tensor
+            audio samples to be preprocessed
+
+        Returns
+        -------
+        torch.Tensor
+            preprocessed audio
+        """
         audio = torch.clamp(audio, -1.0, 1.0)
         return self.beats.process_audio_beats(audio)
 
     def __call__(self, x):
+        """
+        Get the BEATs embeddings for the input.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            preprocessed audio
+
+        Returns
+        -------
+        torch.Tensor
+            BEATs embeddings
+        """
         return self.beats.get_embeddings(x)

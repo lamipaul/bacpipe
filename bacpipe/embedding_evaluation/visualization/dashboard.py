@@ -3,6 +3,7 @@ import matplotlib
 import sys
 import seaborn as sns
 import numpy as np
+import pandas as pd
 import logging
 from pathlib import Path
 
@@ -10,6 +11,10 @@ logger = logging.getLogger("bacpipe")
 
 import importlib.resources as pkg_resources
 import bacpipe.imgs
+
+from bacpipe.core.experiment_manager import (
+    replace_default_kwargs_with_user_kwargs
+    )
 from .visualize_embeddings import (
     plot_embeddings,
     plot_comparison,
@@ -19,12 +24,12 @@ from . import tooltips
 from .visualize import (
     plot_clusterings,
     clustering_overview,
-    plot_overview_results,
 )
 from .visualize_spectrograms import SpectrogramPlot
 from .visualize_predictions import (
     plot_classification_results,
     plot_classification_heatmap,
+    plot_per_class_results,
     PredictionsLoader,
 )
 
@@ -37,25 +42,163 @@ matplotlib.use("agg")
 pn.extension("plotly")
 
 
+def _prefer_passed_value(passed_value, key, kwargs):
+    """
+    Prefer an explicitly passed argument over the default from ``kwargs``.
+
+    ``replace_default_kwargs_with_user_kwargs`` fills ``kwargs`` with the
+    defaults of ``config.yaml``/``settings.yaml``, including the keys that
+    :class:`DashBoard` takes as explicit arguments. Those arguments are bound
+    to the parameters and are therefore no longer part of ``kwargs``, so
+    reading the value from ``kwargs`` first would silently override them
+    (e.g. a ``main_results_dir`` passed by the user would be replaced by the
+    default ``"bacpipe_results"`` and no embeddings would be found).
+
+    The key is always removed from ``kwargs``, so that the value cannot
+    collide with the explicitly passed arguments of the plot functions later
+    on.
+
+    Parameters
+    ----------
+    passed_value : object
+        value that was passed to the parameter, ``None`` if it was omitted
+    key : str
+        name of the parameter, i.e. the key of the default in ``kwargs``
+    kwargs : dict
+        merged config/settings dict, the key is popped from it
+
+    Returns
+    -------
+    object
+        the passed value, or the default from ``kwargs`` if it was omitted
+    """
+    default_value = kwargs.pop(key, None)
+    return default_value if passed_value is None else passed_value
+
+
+def get_ground_truth_label_names(model_names, only_embed_annotations=False):
+    """
+    Collect the names of the ground truth labels that are available for the
+    given models.
+
+    Only the ground truth files of the active ``only_embed_annotations`` mode
+    are taken into account, because the files of the other mode hold a
+    different number of rows and would therefore not align with the
+    embeddings of this run. The ``_only_annotated`` suffix of the file names
+    is removed, as it is a detail of the caching of the ground truth files
+    and not part of the label name.
+
+    Parameters
+    ----------
+    model_names : list
+        names of the models to check
+    only_embed_annotations : bool, optional
+        if True, only the annotated segments were embedded, by default False
+
+    Returns
+    -------
+    list
+        ground truth label names, e.g. ``["species"]``
+    """
+    label_names = []
+    for model_name in model_names:
+        ground_truth_files = le.select_ground_truth_files_for_mode(
+            list(le.get_paths(model_name).labels_path.glob("ground_truth*")),
+            only_embed_annotations=only_embed_annotations,
+        )
+        for gt_file in ground_truth_files:
+            if gt_file.suffix == ".csv":
+                le.get_ground_truth(
+                    model_name, file_path=gt_file, return_type="dataframe"
+                )
+            elif gt_file.suffix == ".npy":
+                le.get_ground_truth(
+                    model_name, file_path=gt_file, return_type="array"
+                )
+            else:
+                continue
+            label_names.append(
+                le.strip_only_annotated_suffix(
+                    gt_file.stem.replace("ground_truth_", "")
+                )
+            )
+    return label_names
+
+
 class DashBoard(DashBoardHelper):
+    """
+    Panel dashboard visualizing embeddings, clustering, probing results and
+    classifier predictions for one or multiple models.
+    """
+
     def __init__(
         self,
         model_names,
         audio_dir,
-        main_results_dir,
-        default_label_keys,
-        evaluation_task,
-        dim_reduction_model,
-        dim_reduc_parent_dir,
+        main_results_dir=None,
+        metadata_label_keys=None,
+        evaluation_task=None,
+        dim_reduction_model=None,
+        dim_reduc_parent_dir=None,
         **kwargs,
     ):
+        """
+        Initialize the dashboard and its widgets.
+
+        The ``label_by`` options are built from the ``metadata_label_keys``,
+        the available ground truth labels and the clustering results. Only the
+        ground truth files of the active ``only_embed_annotations`` mode are
+        offered, and their ``_only_annotated`` suffix is removed so that the
+        label names are identical in both modes.
+
+        Parameters
+        ----------
+        model_names : list
+            names of the models to visualize
+        audio_dir : pathlib.Path
+            directory containing the audio files
+        main_results_dir : pathlib.Path
+            directory containing the evaluation results
+        metadata_label_keys : list
+            default label keys used for coloring
+        evaluation_task : str
+            evaluation tasks to display (e.g., clustering, probing)
+        dim_reduction_model : str
+            dimensionality reduction model used for the embeddings
+        dim_reduc_parent_dir : pathlib.Path
+            parent directory of the reduced embeddings
+        **kwargs
+            additional keyword arguments (e.g., plot heights, widths,
+            ``only_embed_annotations``)
+        """
         self.models = model_names
-        self.default_label_keys = default_label_keys
+        kwargs = replace_default_kwargs_with_user_kwargs(remove_keys=['audio_dir'], **kwargs)
+        
+        self.evaluation_task = _prefer_passed_value(
+            evaluation_task, "evaluation_task", kwargs
+        )
+        self.dim_reduction_model = _prefer_passed_value(
+            dim_reduction_model, "dim_reduction_model", kwargs
+        )
+        self.metadata_label_keys = _prefer_passed_value(
+            metadata_label_keys, "metadata_label_keys", kwargs
+        )
+        self.main_results_dir = _prefer_passed_value(
+            main_results_dir, "main_results_dir", kwargs
+        )
+        self.dim_reduc_parent_dir = _prefer_passed_value(
+            dim_reduc_parent_dir, "dim_reduc_parent_dir", kwargs
+        )
+
+        
         self.audio_dir = audio_dir
         self.path_func = le.make_set_paths_func(
-            audio_dir, main_results_dir, dim_reduc_parent_dir, **kwargs
+            audio_dir, 
+            self.main_results_dir, 
+            self.dim_reduc_parent_dir, 
+            **kwargs
         )
-        self.label_by = default_label_keys.copy()
+        self.label_by = self.metadata_label_keys.copy()
         if (
             self.path_func(model_names[0]).preds_path
         ).exists() and not "default_classifier" in self.label_by:
@@ -68,44 +211,41 @@ class DashBoard(DashBoardHelper):
                 if clfier_paths[0].exists():
                     self.label_by += ["default_classifier"]
         self.plot_path = self.path_func(model_names[0]).plot_path.parent.parent
-        self.dim_reduc_parent_dir = dim_reduc_parent_dir
 
         self.ground_truth = None
-        ground_truth_files = list(
-            le.get_paths(model_names[0]).labels_path.glob("ground_truth*")
+        # ground truth files of both only_embed_annotations modes can be
+        # present, only the files of the active mode align with the
+        # embeddings of this run. The mode of the run is taken from the
+        # settings unless the user overrides it with a kwarg.
+        gt_label_names = get_ground_truth_label_names(
+            model_names,
+            only_embed_annotations=kwargs.get(
+                "only_embed_annotations",
+                bacpipe.settings.only_embed_annotations,
+            ),
         )
-        if len(ground_truth_files) > 0:
-            labels = []
-            if len(ground_truth_files) > 0:
-                for gt_file in ground_truth_files:
-                    if gt_file.suffix == ".csv":
-                        ground_truth_df = le.get_ground_truth(
-                            model_names[0],
-                            file_path=gt_file,
-                            return_type="dataframe",
-                        )
-                    elif gt_file.suffix == ".npy":
-                        ground_truth_df = le.get_ground_truth(
-                            model_names[0],
-                            file_path=gt_file,
-                            return_type="array",
-                        )
-                    labels.append(gt_file.stem.split("_")[-1])
+        if len(gt_label_names) > 0:
             self.ground_truth = True
-            self.label_by += labels
+            self.label_by += gt_label_names
+        self.label_by = list(set(self.label_by))
+        self.label_by.sort(reverse=True)
 
         if (
             len(list(le.get_paths(model_names[0]).clust_path.glob("*.npy")))
             > 0
         ):
-            self.label_by += ["kmeans"]
+            self.label_by += [
+                clustering['name']
+                for clustering in kwargs.get(
+                    "clust_configs", bacpipe.settings.clust_configs
+                ).values()
+                if clustering['bool'] is True
+            ]
 
-        self.evaluation_task = evaluation_task
-        self.dim_reduction_model = dim_reduction_model
         self.widget_width = 100
         self.vis_loader = EmbedAndLabelLoader(
-            dim_reduction_model=dim_reduction_model,
-            default_label_keys=default_label_keys,
+            dim_reduction_model=self.dim_reduction_model,
+            metadata_label_keys=self.metadata_label_keys,
             **kwargs,
         )
 
@@ -125,6 +265,7 @@ class DashBoard(DashBoardHelper):
         self.embed_notification = dict()
 
         self.interactive_embed_plot = dict()
+        self._embed_view_ranges = dict()
         self.spectrogram_plot_panel = dict()
         self.spec_plot_obj = dict()
         self._trigger_spec_obj_update = dict()
@@ -142,6 +283,40 @@ class DashBoard(DashBoardHelper):
         self.kwargs = kwargs
 
     def embedding_panel(self, widget_idx=0):
+        """
+        Build the 2D embedding plot panel for a widget.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+
+        Returns
+        -------
+        tuple of (str, pn.Column)
+            panel title and the column containing the plot
+        """
+        # ``self.kwargs`` holds the merged config/settings dict and includes
+        # the ``dashboard`` flag from ``config.yaml``. Splatting it verbatim
+        # next to the explicitly passed ``dashboard=True``/``dashboard_idx=...``
+        # (and the other keys below) would raise
+        # "TypeError: got multiple values for keyword argument 'dashboard'".
+        # Filter those keys out so user kwargs still forward without colliding.
+        plot_kwargs = {
+            key: value
+            for key, value in self.kwargs.items()
+            if key
+            not in {
+                "loader",
+                "model_name",
+                "label_by",
+                "ground_truth",
+                "dim_reduction_model",
+                "remove_noise",
+                "dashboard",
+                "dashboard_idx",
+            }
+        }
         if not self.interactive_embedding_plot:
             embedding_plot = self.init_plot(
                 # self.init_interactive_plot(
@@ -151,6 +326,7 @@ class DashBoard(DashBoardHelper):
                 loader=self.vis_loader,
                 model_name=self.model_select[widget_idx],
                 label_by=self.label_select[widget_idx],
+                metadata_label_keys=self.metadata_label_keys,
                 ground_truth=self.ground_truth,
                 dim_reduction_model=self.dim_reduction_model,
                 remove_noise=(
@@ -160,6 +336,7 @@ class DashBoard(DashBoardHelper):
                 ),
                 dashboard=True,
                 dashboard_idx=widget_idx,
+                **plot_kwargs,
             )
         else:
 
@@ -167,6 +344,14 @@ class DashBoard(DashBoardHelper):
 
             # Callback to update plot when any selector changes, while preserving accordion state.
             def update_plot_on_change(event):
+                """
+                Redraw the embedding plot when a selector value changes.
+
+                Parameters
+                ----------
+                event : object or None
+                    panel parameter change event, or None on first render
+                """
                 self.update_main_plot(
                     "interactive_embed",
                     plot_embeddings,
@@ -174,6 +359,7 @@ class DashBoard(DashBoardHelper):
                     loader=self.vis_loader,
                     model_name=self.model_select[widget_idx].value,
                     label_by=self.label_select[widget_idx].value,
+                    metadata_label_keys=self.metadata_label_keys,
                     ground_truth=self.ground_truth,
                     dim_reduction_model=self.dim_reduction_model,
                     remove_noise=(
@@ -184,6 +370,7 @@ class DashBoard(DashBoardHelper):
                     ),
                     dashboard=True,
                     dashboard_idx=widget_idx,
+                    **plot_kwargs,
                 )
 
             # Only attach watchers once per widget (check if already attached)
@@ -223,16 +410,37 @@ class DashBoard(DashBoardHelper):
         )
 
     def spectrogram_panel(self, widget_idx=0):
+        """
+        Build the spectrogram plot panel for a widget.
 
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+
+        Returns
+        -------
+        tuple of (str, pn.Column)
+            panel title and the column containing the plot
+        """
         self.spectrogram_plot_panel[widget_idx] = pn.pane.Plotly(
-            SpectrogramPlot.dummy_image(title=""),
+            SpectrogramPlot.dummy_image(
+                title="",
+                height=self.kwargs.get(
+                    "spectrogram_plot_height",
+                    bacpipe.settings.spectrogram_plot_height,
+                ),
+            ),
             sizing_mode="stretch_width",
-            height=self.kwargs.get("spectrogram_plot_height"),
+            height=self.kwargs.get(
+                "spectrogram_plot_height",
+                bacpipe.settings.spectrogram_plot_height,
+            ),
         )
 
         embedding_info_dialogue = pn.widgets.StaticText(
             value="",
-            width=self.kwargs.get("accordion_width") - 80,
+            sizing_mode="stretch_width",
         )
 
         self.spec_plot_obj[widget_idx] = SpectrogramPlot(
@@ -240,6 +448,13 @@ class DashBoard(DashBoardHelper):
             self.vis_loader,
             self.model_select[widget_idx],
             embedding_info_dialogue,
+            paths=self.path_func,
+            remove_noise=(
+                self.noise_select[widget_idx]
+                if widget_idx in self.noise_select
+                and self.noise_select[widget_idx] is not None
+                else None
+            ),
             **self.kwargs,
         )
 
@@ -277,6 +492,19 @@ class DashBoard(DashBoardHelper):
         )
 
     def clustering_panel(self, widget_idx):
+        """
+        Build the clustering results panel for a widget.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+
+        Returns
+        -------
+        tuple of (str, pn.Column)
+            panel title and the column containing the clustering plot
+        """
         return (
             "Clustering Results",
             (
@@ -305,6 +533,19 @@ class DashBoard(DashBoardHelper):
         )
 
     def probing_panel(self, widget_idx):
+        """
+        Build the probing performance panel for a widget.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+
+        Returns
+        -------
+        tuple of (str, pn.Column)
+            panel title and the column containing the probing plot
+        """
         return (
             "Probing Performance",
             (
@@ -329,6 +570,21 @@ class DashBoard(DashBoardHelper):
         )
 
     def model_page(self, widget_idx, single_model=False):
+        """
+        Build the single model dashboard page.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+        single_model : bool
+            if True, panels are laid out for a single model
+
+        Returns
+        -------
+        pn.Row
+            row containing the sidebar and the model content
+        """
         sidebar = self.make_sidebar(widget_idx, model=True)
         title_string = "Model Dashboard for {}".format
         accordion_title = pn.bind(title_string, self.model_select[widget_idx])
@@ -337,13 +593,14 @@ class DashBoard(DashBoardHelper):
                 pn.Accordion(
                     self.embedding_panel(widget_idx),
                     active=[0],
-                    width=self.kwargs.get("accordion_width"),
+                    sizing_mode="stretch_width",
                 ),
                 pn.Accordion(
                     self.spectrogram_panel(widget_idx),
                     self.clustering_panel(widget_idx),
                     self.probing_panel(widget_idx),
                     active=[0, 1, 2],
+                    sizing_mode="stretch_width",
                 ),
             )
         else:
@@ -353,7 +610,7 @@ class DashBoard(DashBoardHelper):
                 self.clustering_panel(widget_idx),
                 self.probing_panel(widget_idx),
                 active=[0, 1, 2, 3],
-                width=self.kwargs.get("accordion_width"),
+                sizing_mode="stretch_width",
             )
 
         main_content = pn.Column(
@@ -367,13 +624,25 @@ class DashBoard(DashBoardHelper):
                 },
             ),
             data_panels,
-            # width=self.kwargs.get('accordion_width'),
-            # sizing_mode="stretch_both",
+            sizing_mode="stretch_width",
         )
 
-        return pn.Row(sidebar, main_content)  # , sizing_mode="stretch_both")
+        return pn.Row(sidebar, main_content, sizing_mode="stretch_width")
 
     def all_models_page(self, widget_idx):
+        """
+        Build the dashboard page comparing all models.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+
+        Returns
+        -------
+        pn.Row
+            row containing the sidebar and the all-models content
+        """
         sidebar = self.make_sidebar(widget_idx, model=False, all_models=True)
 
         main_content = pn.Column(
@@ -395,7 +664,7 @@ class DashBoard(DashBoardHelper):
                             if len(self.noise_select.keys()) > 0
                             else False
                         ),
-                        default_label_keys=self.default_label_keys,
+                        metadata_label_keys=self.metadata_label_keys,
                         dashboard=True,
                     ),
                 ),
@@ -430,9 +699,9 @@ class DashBoard(DashBoardHelper):
                     "Probing Metrics",
                     (
                         self.plot_widget(
-                            plot_overview_results,
+                            plot_per_class_results,
                             plot_path=None,
-                            metrics=None,
+                            results=None,
                             task_name=self.class_select[widget_idx],
                             path_func=self.path_func,
                             model_list=self.models,
@@ -445,16 +714,28 @@ class DashBoard(DashBoardHelper):
                         )
                     ),
                 ),
-                # sizing_mode="stretch_width",
                 active=[0, 1, 2],
+                sizing_mode="stretch_width",
             ),
-            width=2 * self.kwargs.get("accordion_width"),
-            # sizing_mode="stretch_both",
+            sizing_mode="stretch_width",
         )
 
-        return pn.Row(sidebar, main_content)  # , sizing_mode="stretch_both")
+        return pn.Row(sidebar, main_content, sizing_mode="stretch_width")
 
     def apply_clfier_page(self, widget_idx):
+        """
+        Build the page for applying a classifier to model predictions.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+
+        Returns
+        -------
+        pn.Row
+            row containing the sidebar and the classification content
+        """
         self.class_options[widget_idx] = []
         sidebar = self.make_sidebar(
             widget_idx, model=True, classifier_page=True
@@ -523,7 +804,7 @@ class DashBoard(DashBoardHelper):
         )
 
         main_content = pn.Column(
-            pn.pane.Markdown("## All Models Dashboard"),
+            pn.pane.Markdown("## Classifier Predictions"),
             pn.Accordion(
                 (
                     "Classification settings",
@@ -532,11 +813,21 @@ class DashBoard(DashBoardHelper):
                         self.clfier_path[widget_idx],
                         # after that show me the classes that this
                         # linear classifier will classify
-                        pn.widgets.StaticText(
-                            name="Classes",
-                            value=pn.bind(
-                                self.preds_data[widget_idx].get_classes,
-                                self.clfier_path[widget_idx],
+                        pn.Column(
+                            pn.pane.Markdown("**Classes**"),
+                            pn.pane.DataFrame(
+                                pn.bind(
+                                    lambda path: pd.DataFrame(
+                                        {
+                                            "Classes": self.preds_data[
+                                                widget_idx
+                                            ].get_classes(path)
+                                        }
+                                    ),
+                                    self.clfier_path[widget_idx],
+                                ),
+                                width=400,
+                                height=300,
                             ),
                         ),
                         # input section to give a threshold for classification
@@ -567,16 +858,39 @@ class DashBoard(DashBoardHelper):
                     ),
                 ),
                 active=[0, 1, 2],
+                sizing_mode="stretch_width",
                 # by default create all annotations as one big annotations file
                 # # add button to save as raven annotations
             ),
-            width=self.kwargs.get("accordion_width"),
+            sizing_mode="stretch_width",
+            # The predictions only need half the window width; keep the page
+            # compact so the heatmap does not stretch across the full browser.
+            styles={"max-width": "50%"},
         )
-        return pn.Row(sidebar, main_content)  # , sizing_mode="stretch_both")
+        return pn.Row(sidebar, main_content, sizing_mode="stretch_width")
 
     def make_sidebar(
         self, widget_idx, model=True, classifier_page=False, all_models=False
     ):
+        """
+        Build the sidebar widgets for a dashboard page.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget
+        model : bool
+            whether to include the model selector
+        classifier_page : bool
+            whether the sidebar belongs to the classifier page
+        all_models : bool
+            whether the sidebar belongs to the all-models page
+
+        Returns
+        -------
+        pn.Column
+            column of sidebar widgets
+        """
         widgets = [pn.pane.Markdown("## Settings")]
 
         if model:
@@ -695,13 +1009,14 @@ class DashBoard(DashBoardHelper):
         model_all_page = self.all_models_page(3)
         apply_classifier0_page = self.apply_clfier_page(4)
         apply_classifier1_page = self.apply_clfier_page(5)
+        apply_classifier2_page = self.apply_clfier_page(6)
 
         # Extract sidebars and content
         sidebar0, content0 = model0_page.objects
         sidebar1, content1 = model1_page.objects
         sidebar2, content2 = model2_page.objects
-        sidebar3, content3 = apply_classifier0_page.objects
         sidebar4, content4 = apply_classifier1_page.objects
+        sidebar5, content5 = apply_classifier2_page.objects
 
         # Wrap sidebars with titles
         sidebar0 = pn.Column(
@@ -724,22 +1039,32 @@ class DashBoard(DashBoardHelper):
                 ),
             ),
             ("All models", model_all_page),
-            ("Single Model Predictions", apply_classifier1_page),
+            ("Single Model Predictions", apply_classifier0_page),
             (
                 "Two Model Predictions",
                 pn.Row(
-                    pn.Column(sidebar3, sidebar4),
-                    pn.Row(content3, content4),
+                    pn.Column(sidebar4, sidebar5),
+                    pn.Row(content4, content5),
                     sizing_mode="stretch_both",
                 ),
             ),
+            dynamic=True,
         )
 
         self.add_styling(
-            model0_page, model2_page, model_all_page, apply_classifier1_page
+            model0_page, model2_page, model_all_page, apply_classifier0_page
         )
 
     def add_styling(self, *pages):
+        """
+        Add the logo, contact info, and close button to each page sidebar.
+
+        Parameters
+        ----------
+        *pages
+            dashboard pages whose sidebars should be styled
+        """
+
         
         logo = pkg_resources.files("bacpipe") / "imgs" / "bacpipe_unlabelled.png"
             
@@ -767,6 +1092,14 @@ class DashBoard(DashBoardHelper):
             close_button = pn.widgets.Button(name="❌ close dashboard")
 
             def shutdown_callback(event):
+                """
+                Shut down the dashboard server.
+
+                Parameters
+                ----------
+                event : object
+                    panel button click event
+                """
                 logger.info("Shutting down dashboard server...")
                 sys.exit(0)
 
@@ -788,14 +1121,101 @@ def visualize_using_dashboard(
     An example file can be found in 'bacpipe/tests/test_data/annotations.csv'.
     Multiple dashboards can be opened, the port will simply increment.
 
+    Examples::
+    
+        # Serve the interactive dashboard for the ``birdnet`` embeddings on the
+        # test data. This starts a blocking server, so it is usually run as a
+        # standalone command and not inside a script:
+
+        bacpipe.visualize_using_dashboard(
+            models=['birdnet'],
+            audio_dir='bacpipe/tests/test_data',
+            main_results_dir='bacpipe_results',
+        )
+
+        # Additional information about the recordings can be passed as a
+        # dataframe. Its extra columns (here 'annotator' and
+        # 'recording_site') are shown next to the spectrogram of a clicked
+        # point. The rows are matched to the embedded segments on
+        # 'audiofilename' and 'start', so an unsorted or incomplete table
+        # is fine:
+
+        import pandas as pd
+
+        annotations_df = pd.read_csv(
+            'bacpipe/tests/test_data/annotations.csv'
+        )
+        annotations_df['annotator'] = 'reviewer_1'
+        annotations_df['recording_site'] = [
+            'site_a' if 'FewShot' in name else 'site_b'
+            for name in annotations_df.audiofilename
+        ]
+
+        bacpipe.visualize_using_dashboard(
+            models=['birdnet'],
+            audio_dir='bacpipe/tests/test_data',
+            main_results_dir='bacpipe_results',
+            annotations_df=annotations_df,
+        )
+
     Parameters
     ----------
     models : list
         embedding models
+    dashboard_port : int, optional
+        port the dashboard is served on, by default 5006
+    dashboard_address : str, optional
+        address the dashboard is served on, by default "localhost"
+    dashboard_websocket_origin : bool, optional
+        whether to allow cross origin websocket connections,
+        by default False
     kwargs : dict
-        Dictionary with parameters for dashboard creation
+        Dictionary with parameters for dashboard creation. Next to the
+        settings of ``config.yaml``/``settings.yaml`` the most relevant ones
+        are:
+
+        ``audio_dir`` : str, path to the audio files the embeddings were
+        computed from
+
+        ``main_results_dir`` : str, top level directory of the results
+
+        ``annotations_df`` : pandas.DataFrame, optional table with additional
+        information about the segments. Its extra columns are displayed with
+        the spectrogram of a clicked point. The rows are matched on
+        ``audiofilename`` and ``start``, so unsorted or incomplete tables are
+        fine. Without this kwarg only the labels bacpipe generated itself are
+        shown.
+
+        ``CustomModels`` : list, one model class per entry of ``models``
+        (``None`` for the models integrated in bacpipe)
     """
-    models = [bacpipe.confirm_model_name(model) for model in models]
+    # ``CustomModels`` pairs one model class (or None for an integrated
+    # model) with every entry of ``models``, while ``confirm_model_name``
+    # validates a single model at a time and therefore expects the singular
+    # ``CustomModel``. Forwarding the plural kwarg verbatim would make the
+    # name check reject the names of custom models.
+    custom_models = kwargs.get("CustomModels")
+    if custom_models is not None and not isinstance(
+        custom_models, (list, tuple)
+    ):
+        custom_models = [custom_models] * len(models)
+    if custom_models is None:
+        custom_models = [None] * len(models)
+    if not len(custom_models) == len(models):
+        raise AssertionError(
+            "If you provide custom models, the array needs to be the same "
+            "length as the model name array. That way the association is "
+            "clear. \n For example: models = ['birdnet', 'my_model'] and "
+            "CustomModels=[None, MyModel]."
+        )
+    models = [
+        (
+            bacpipe.confirm_model_name(model, **kwargs)
+            if custom_model is None
+            else bacpipe.confirm_model_name(model, CustomModel=custom_model)
+        )
+        for model, custom_model in zip(models, custom_models)
+    ]
     from bacpipe.embedding_evaluation.visualization.dashboard import DashBoard
     import panel as pn
 
@@ -806,12 +1226,13 @@ def visualize_using_dashboard(
     try:
         dashboard.build_layout()
     except Exception as e:
-        logger.exception(
-            f"\nError building dashboard layout: {e}\n \n "
+        error_string = (
+            f"\nError building dashboard layout: {str(e)}\n \n "
             "Are you sure all the evaluations have been performed? "
             "If not, rerun the pipeline with `overwrite=True`.\n \n "
         )
-        raise e
+        logger.exception(error_string)
+        raise ValueError(error_string)
 
     favicon_logo = pkg_resources.files("bacpipe") / "imgs" / "bacpipe_favicon_white.png"
     

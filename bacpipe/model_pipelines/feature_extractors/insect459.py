@@ -11,11 +11,14 @@ LENGTH_IN_SAMPLES = int(5.5 * SAMPLE_RATE)
 
 class Model(ModelBaseClass):
     def __init__(self, **kwargs):
+        """
+        Initialize the Insect459 model.
+        """
         super().__init__(
             sr=SAMPLE_RATE, segment_length=LENGTH_IN_SAMPLES, **kwargs
         )
         with open(
-            f"{self.model_base_path}/insect66/config_insecteffnet.yaml", "rt"
+            f"{self.model_utils_base_path}/insect66/config_insecteffnet.yaml", "rt"
         ) as infp:
             cfg = SimpleNamespace(**yaml.safe_load(infp))
 
@@ -34,13 +37,41 @@ class Model(ModelBaseClass):
         self.model.load_state_dict(state_dict)
 
     def preprocess(self, audio):
+        """
+        Convert the audio samples to a mel spectrogram.
+
+        Parameters
+        ----------
+        audio : torch.Tensor
+            audio samples to be preprocessed
+
+        Returns
+        -------
+        torch.Tensor
+            mel spectrogram
+        """
         audio = audio[:, None, :]
 
         # (bs, channel, mel, time)
+        if self.device != 'cpu':
+            audio = audio.to(self.device)
         return self.model.wav2timefreq(audio)
 
     @torch.inference_mode()
     def __call__(self, input):
+        """
+        Run the model on the input spectrogram.
+
+        Parameters
+        ----------
+        input : torch.Tensor
+            input mel spectrogram
+
+        Returns
+        -------
+        torch.Tensor
+            model embeddings
+        """
         self.model.block_features = self.model.backbone.blocks(
             self.model.backbone.bn1(self.model.backbone.conv_stem(input))
         )

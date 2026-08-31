@@ -9,6 +9,10 @@ logger = logging.getLogger("bacpipe")
 
 
 class ProbeDatasetLoader(Dataset):
+    """
+    PyTorch Dataset yielding embedding/label pairs for probe classification.
+    """
+
     def __init__(self, class_df, embeds, label2index, set_name=None, **kwargs):
         """
         Class to initialize and iterate through classification dataset.
@@ -40,6 +44,14 @@ class ProbeDatasetLoader(Dataset):
         self.dataset = self.dataset.sample(frac=1, random_state=42)
 
     def __len__(self):
+        """
+        Get the number of samples in the dataset.
+
+        Returns
+        -------
+        int
+            number of samples in the dataset
+        """
         return len(self.dataset)
 
     def __getitem__(self, idx):
@@ -118,31 +130,80 @@ def generate_annotations_for_probing_task(
     ground_truth,
     paths,
     label_column,
-    dataset_csv_path="probe_annotations.csv",
+    dataset_csv_path="probing_dataframe.csv",
     train_ratio=None,
     test_ratio=None,
     seed=42,
     **kwargs,
 ):
+    """
+    Generate the probing annotations dataframe from the ground truth. The
+    labels are determined from the simultaneous labels in the ground truth
+    and the samples are split into train, test and validation sets per
+    species. If the dataframe already exists, it is loaded instead.
+
+    Parameters
+    ----------
+    ground_truth : pandas.DataFrame
+        ground truth dataframe containing the species labels
+    paths : SimpleNamespace
+        object with the paths used for saving the probing dataframe
+    label_column : str
+        name of the label column
+    dataset_csv_path : str, optional
+        path to the probing dataframe csv file, by default
+        "probing_dataframe.csv". Relative paths are resolved against
+        ``paths.labels_path`` when a ``paths`` object is available.
+    train_ratio : float, optional
+        proportion of samples used for training, by default None
+    test_ratio : float, optional
+        proportion of samples used for testing, by default None
+    seed : int, optional
+        random seed used for shuffling, by default 42
+
+    Returns
+    -------
+    pandas.DataFrame
+        probing annotations dataframe
+    """
     import bacpipe
 
     if train_ratio is None:
-        train_ratio = bacpipe.settings.probe_configs["config_1"]["train_ratio"]
+        train_ratio = bacpipe.settings.train_ratio
     if test_ratio is None:
-        test_ratio = bacpipe.settings.probe_configs["config_1"]["test_ratio"]
+        test_ratio = bacpipe.settings.test_ratio
+
+    # The probing dataframe is cached inside the labels directory of the model
+    # evaluation results whenever a ``paths`` object is available. Relative
+    # ``dataset_csv_path`` values (e.g. ``probing_dataframe.csv`` from the probe
+    # configs in settings.yaml) are therefore resolved against ``labels_path``.
+    if paths is not None:
+        dataset_csv_path = Path(dataset_csv_path)
+        if not dataset_csv_path.is_absolute():
+            dataset_csv_path = Path(paths.labels_path) / dataset_csv_path
+
+    # Isolate the cached probing dataframe per ``only_embed_annotations`` mode
+    # so that switching modes with ``overwrite=False`` does not silently reuse
+    # a dataframe that was generated for the other mode.
+    if kwargs.get("only_embed_annotations"):
+        dataset_csv_path = Path(dataset_csv_path)
+        if not dataset_csv_path.name.endswith("_only_annotated.csv"):
+            dataset_csv_path = dataset_csv_path.with_name(
+                dataset_csv_path.stem + "_only_annotated.csv"
+            )
 
     if paths is None or not Path(dataset_csv_path).exists():
         rng = np.random.default_rng(seed=seed)
 
         non_species_labels = [
-            "starts",
-            "ends",
+            "start",
+            "end",
             "audiofilename",
-            "species_richness",
+            "simultaneous_labels",
         ]
         species = ground_truth.drop(columns=non_species_labels).columns
 
-        active_starts = ground_truth.species_richness == 1
+        active_starts = ground_truth.simultaneous_labels == 1
         gt_4_probing = ground_truth[active_starts.values]
         gt_4_probing.index = range(len(gt_4_probing))
 
@@ -156,17 +217,17 @@ def generate_annotations_for_probing_task(
 
         if not paths is None:
             filenames = gt_4_probing["audiofilename"]
-            starts, ends = gt_4_probing["starts"], gt_4_probing["ends"]
+            starts, ends = gt_4_probing["start"], gt_4_probing["end"]
             df["audiofilename"] = filenames
-            df["starts"] = starts
-            df["ends"] = ends
+            df["start"] = starts
+            df["end"] = ends
 
         df["label"] = active_labels
         df.index = range(len(df))
         df["predefined_set"] = "undefined"
         for v in species:
             num_species_occurances = gt_4_probing[v].sum()
-            ar = gt_4_probing[gt_4_probing[v] == 1].index.values
+            ar = gt_4_probing[gt_4_probing[v] == 1].index.values.tolist()
             rng.shuffle(ar)
             tr_ar = ar[: int(num_species_occurances * train_ratio)]
             te_ar = ar[
@@ -183,43 +244,15 @@ def generate_annotations_for_probing_task(
             df.loc[te_ar, "predefined_set"] = "test"
             df.loc[va_ar, "predefined_set"] = "val"
 
-        df = df.sort_values(by=["audiofilename", "starts"])
+        df = df.sort_values(by=["audiofilename", "start"])
 
-        if paths is None:
-            df.to_csv(dataset_csv_path, index=False)
-        else:
-            df.to_csv(
-                paths.labels_path.joinpath("probing_dataframe.csv"),
-                index=False,
-            )
+        Path(dataset_csv_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(dataset_csv_path, index=False)
     else:
         logger.info(
-            f"Found file: {str(dataset_csv_path)}. Loading dataframe probing "
+            f"\nFound file: {str(dataset_csv_path)}. Loading dataframe probing "
             "dataframe. If you would like to automatically create a new probing "
-            "dataframe. Please delete the existing one."
+            "dataframe. Please delete the existing one.\n"
         )
         df = pd.read_csv(dataset_csv_path, index_col=False)
     return df
-
-def get_filenames_and_starts_for_probe_df(paths, ground_truth, label_column):
-    from bacpipe.embedding_evaluation.label_embeddings import (
-        get_default_labels,
-        get_dt_filename,
-    )
-    import datetime as dt
-
-    model_name = paths.labels_path.parent.stem
-    default_labels = get_default_labels(model_name, overwrite=False)
-    filenames = np.array(default_labels["audio_file_name"])[
-        ground_truth[f"label:{label_column}"] > -1
-    ]
-    times_of_day = np.array(default_labels["time_of_day"])[
-        ground_truth[f"label:{label_column}"] > -1
-    ]
-    starts = [
-        (
-            dt.datetime.strptime(tod_e, "%H-%M-%S") - get_dt_filename(tod_f)
-        ).seconds
-        for tod_e, tod_f in zip(times_of_day, filenames)
-    ]
-    return filenames, starts

@@ -1,10 +1,17 @@
 # don't track environment files, model checkpoints, test files, and vscode settings
 env*
 bacpipe/model_checkpoints/*
+bacpipe_model_checkpoints/*
+
+!.github
+.coverage
+uv.lock
 bacpipe/tests/.pytest*
 *__pycache__*
 .vscode
 dist/*
+uv.lock
+.coverage
 
 # Ignore everything in results
 *results/*
@@ -23,6 +30,8 @@ results/test_data/dim_reduced_embeddings/*
 # Sphinx build
 docs/build/
 docs/source/api/bacpipe.*
+docs/source/api/modules.rst
+docs/source/examples/
 
 # ignore test result files
 bacpipe/tests/results_files/*

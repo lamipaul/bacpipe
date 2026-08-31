@@ -12,12 +12,184 @@ sns.set_theme(style="whitegrid")
 
 matplotlib.use("agg")
 
+_SAVE_FIGURE_CHROME_HINT = (
+    "Saving figures requires Google Chrome or Microsoft Edge (kaleido uses it for "
+    "static image export) but none could be found on this system. Install Chrome or "
+    "Edge from your browser's official website, or run `kaleido_get_chrome` in the "
+    "terminal to install a compatible Chrome automatically."
+)
+
+_SAVE_FIGURE_KALEIDO_HINT = (
+    "kaleido is required to save figures but is not installed. Install it with "
+    "`pip install 'kaleido>=1.0.0'` and try again."
+)
+
+
+def _friendly_export_error(exc):
+    """
+    Map kaleido static-export failures to a friendly, actionable message.
+
+    Runs when the "Save Figure" button is clicked: kaleido only needs a browser
+    at export time, so on machines without Chrome/Edge (or without kaleido) the
+    raw library exception would otherwise leak into the dashboard notification.
+
+    Parameters
+    ----------
+    exc : Exception
+        the exception raised while exporting the figure
+
+    Returns
+    -------
+    str or None
+        a friendly hint when ``exc`` is a known kaleido export failure, else
+        ``None`` so callers can fall back to the raw error text
+    """
+    try:
+        import kaleido.errors as kaleido_errors
+    except Exception:  # pragma: no cover - kaleido is a hard dependency
+        kaleido_errors = None
+
+    # kaleido/choreographer cannot find or launch a browser
+    if kaleido_errors is not None:
+        browser_errors = tuple(
+            err
+            for err in (
+                getattr(kaleido_errors, name, None)
+                for name in (
+                    "ChromeNotFoundError",
+                    "BrowserFailedError",
+                    "BrowserDepsError",
+                )
+            )
+            if err is not None
+        )
+        if browser_errors and isinstance(exc, browser_errors):
+            return _SAVE_FIGURE_CHROME_HINT
+
+    # plotly wraps ChromeNotFoundError into a RuntimeError mentioning Chrome,
+    # and choreographer's BrowserDepsError also mentions Chrome in its message
+    if "chrome" in str(exc).lower():
+        return _SAVE_FIGURE_CHROME_HINT
+
+    # plotly raises ValueError when the kaleido package itself is missing
+    if isinstance(exc, ValueError) and "kaleido package" in str(exc).lower():
+        return _SAVE_FIGURE_KALEIDO_HINT
+
+    # defensive: raw ModuleNotFoundError for the kaleido package
+    if isinstance(exc, ModuleNotFoundError) and "kaleido" in str(exc).lower():
+        return _SAVE_FIGURE_KALEIDO_HINT
+
+    return None
+
+
+def _capture_view_ranges(relayout_data):
+    """
+    Extract 2D axis ranges from a plotly ``relayout_data`` event.
+
+    Plotly reports zoom/pan through ``relayout_data`` using either the list
+    form ``{"xaxis.range": [lo, hi], ...}`` or the indexed form
+    ``{"xaxis.range[0]": lo, "xaxis.range[1]": hi, ...}``. Both are handled
+    here so the current view can be re-applied before a static export.
+
+    Parameters
+    ----------
+    relayout_data : dict or None
+        the ``relayout_data`` payload emitted by the Plotly pane
+
+    Returns
+    -------
+    dict
+        maps ``"xaxis"`` and/or ``"yaxis"`` to ``(lo, hi)`` tuples, or is
+        empty when no ranges were reported (e.g. a double-click reset)
+    """
+    if not relayout_data:
+        return {}
+    ranges = {}
+    for axis in ("xaxis", "yaxis"):
+        value = relayout_data.get(f"{axis}.range")
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            ranges[axis] = (value[0], value[1])
+            continue
+        lo = relayout_data.get(f"{axis}.range[0]")
+        hi = relayout_data.get(f"{axis}.range[1]")
+        if lo is not None and hi is not None:
+            ranges[axis] = (lo, hi)
+    return ranges
+
+
+def _apply_view_ranges(fig, ranges):
+    """
+    Apply previously captured axis ranges to a figure so a static export
+    reflects the zoomed-in view the user is currently looking at.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        figure to update
+    ranges : dict
+        output of :func:`_capture_view_ranges`
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        the same figure with the ranges applied
+    """
+    if not ranges:
+        return fig
+    if "xaxis" in ranges:
+        fig.update_xaxes(range=list(ranges["xaxis"]), autorange=False)
+    if "yaxis" in ranges:
+        fig.update_yaxes(range=list(ranges["yaxis"]), autorange=False)
+    return fig
+
+
+def _static_export_figure(fig):
+    """
+    Return a copy of ``fig`` with webgl traces converted to regular SVG
+    scatter traces.
+
+    ``plot_embeddings_px`` renders 2D embeddings with ``render_mode="webgl"``.
+    Kaleido's headless-Chrome export is unreliable for webgl traces (markers
+    and especially the continuous colorbar can be missing), so export a
+    plain-SVG copy instead.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        figure to prepare for export
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        copy of ``fig`` without webgl traces
+    """
+    import json
+
+    import plotly.graph_objects as go
+
+    fig_dict = json.loads(fig.to_json())
+    for trace in fig_dict.get("data", []):
+        if trace.get("type") == "scattergl":
+            trace["type"] = "scatter"
+    return go.Figure(fig_dict)
+
 
 class DashBoardHelper:
+    """
+    Helper class providing shared widget event handlers and figure update
+    logic used by the dashboard pages.
+    """
 
     def handle_selection(self, event, widget_idx=None):
         """
         Triggered when the user uses the Lasso or Box select tool.
+
+        Parameters
+        ----------
+        event : panel param event
+            the selection event triggered by the user
+        widget_idx : int, optional
+            index of the widget the selection belongs to, by default None
         """
         if not event.new:
             return
@@ -42,9 +214,21 @@ class DashBoardHelper:
             logger.info(f"First 5 files: {points['audiofilename'][:5]}")
 
         except Exception as e:
-            logger.info(f"Error handling selection: {e}")
+            logger.info(f"Error handling selection: {str(e)}")
 
     def save_selected_points(self, event, dialogue_panel, widget_idx):
+        """
+        Save the currently selected points to a csv file in the plot path.
+
+        Parameters
+        ----------
+        event : panel event
+            the event triggering the save
+        dialogue_panel : panel widget
+            panel used to show the save confirmation message
+        widget_idx : int
+            index of the widget the selected points belong to
+        """
         if not hasattr(self.spec_plot_obj[widget_idx], "selected_points"):
             dialogue_panel.visible = True
             dialogue_panel.value = "No points have been selected."
@@ -68,6 +252,16 @@ class DashBoardHelper:
         )
 
     def handle_click(self, event, widget_idx=0):
+        """
+        Triggered when the user clicks on a point in the embedding plot.
+
+        Parameters
+        ----------
+        event : panel param event
+            the click event triggered by the user
+        widget_idx : int, optional
+            index of the widget the click belongs to, by default 0
+        """
         if not event.new:
             return
         try:
@@ -91,17 +285,31 @@ class DashBoardHelper:
                 self.spec_plot_obj[widget_idx].play_audio(event=None)
 
         except Exception as e:
-            logger.info(f"Error handling click: {e}")
+            logger.info(f"Error handling click: {str(e)}")
 
     def init_interactive_embed_plot(self, widget_idx):
-        """Initialize interactive embedding plot with dummy figure"""
+        """
+        Initialize interactive embedding plot with dummy figure.
+
+        Parameters
+        ----------
+        widget_idx : int
+            index of the widget to initialize
+        """
         from .visualize_spectrograms import SpectrogramPlot
 
         # Create Plotly pane with dummy figure and reserved height to prevent accordion collapse
         self.interactive_embed_plot[widget_idx] = pn.pane.Plotly(
-            SpectrogramPlot.dummy_image(title="Loading..."),
+            SpectrogramPlot.dummy_image(
+                title="Loading...",
+                height=self.kwargs.get(
+                    "embed_fig_height", settings.embed_fig_height
+                ),
+            ),
             sizing_mode="stretch_width",
-            height=settings.embed_fig_height,
+            height=self.kwargs.get(
+                "embed_fig_height", settings.embed_fig_height
+            ),
             config={"responsive": True},
         )
 
@@ -112,6 +320,11 @@ class DashBoardHelper:
         self.interactive_embed_plot[widget_idx].param.watch(
             lambda x: self.handle_selection(x, widget_idx), "selected_data"
         )
+        # Track zoom/pan so the "Save Figure" button can export the currently
+        # displayed view rather than the full (unzoomed) figure.
+        self.interactive_embed_plot[widget_idx].param.watch(
+            lambda x: self._store_view_ranges(x, widget_idx), "relayout_data"
+        )
         button = pn.widgets.Button(name="Save Figure", button_type="primary")
         notification = pn.pane.Markdown("")
 
@@ -121,8 +334,36 @@ class DashBoardHelper:
         self.embed_save_button[widget_idx] = button
         self.embed_notification[widget_idx] = notification
 
+    def _store_view_ranges(self, event, widget_idx):
+        """
+        Store the current zoom/pan ranges of the embedding plot.
+
+        Parameters
+        ----------
+        event : panel event
+            the ``relayout_data`` event triggered by the user zooming/panning
+        widget_idx : int
+            index of the widget whose view changed
+        """
+        ranges = _capture_view_ranges(event.new if event else None)
+        if ranges:
+            self._embed_view_ranges[widget_idx] = ranges
+        else:
+            # e.g. a double-click reset returned to the full view
+            self._embed_view_ranges.pop(widget_idx, None)
+
     def _on_save_button_click(self, event, widget_idx):
-        """Button click handler that saves the current embedding plot with preserved zoom/pan"""
+        """
+        Button click handler that saves the current embedding plot with
+        preserved zoom/pan.
+
+        Parameters
+        ----------
+        event : panel event
+            the event triggering the save
+        widget_idx : int
+            index of the widget belonging to the save button
+        """
         model_name = self.model_select[widget_idx].value
         label_by = self.label_select[widget_idx].value
         displayed_fig = self.interactive_embed_plot[widget_idx].object
@@ -131,15 +372,41 @@ class DashBoardHelper:
         save_path = self.path_func(model_name).plot_path / filename
 
         try:
-            displayed_fig.write_image(save_path, width=1200, height=800)
+            # Rebuild a non-webgl copy of the figure (so kaleido renders the
+            # continuous colorbar reliably) and re-apply the current zoom/pan
+            # so the exported PNG matches what the user is looking at. The
+            # canvas is fixed so the plot dimensions never depend on the
+            # width of the legend/colorbar.
+            export_fig = _static_export_figure(displayed_fig)
+            export_fig = _apply_view_ranges(
+                export_fig, self._embed_view_ranges.get(widget_idx, {})
+            )
+            export_fig.write_image(save_path, width=1200, height=800)
             self.embed_notification[widget_idx].object = (
                 f"✓ Saved to: {save_path}"
             )
         except Exception as e:
-            self.embed_notification[widget_idx].object = f"✗ Error: {e}"
+            message = _friendly_export_error(e) or f"Error: {str(e)}"
+            self.embed_notification[widget_idx].object = f"✗ {message}"
 
     def update_main_plot(self, p_type, plot_func, widget_idx, **kwargs):
-        """Update existing plot by just updating the .object"""
+        """
+        Update existing plot by just updating the .object
+
+        Parameters
+        ----------
+        p_type : str
+            type of the plot to update
+        plot_func : callable
+            function that creates the plot
+        widget_idx : int
+            index of the widget to update
+
+        Returns
+        -------
+        panel widget
+            the updated plot panel
+        """
         plots_dict = getattr(self, f"{p_type}_plot")
 
         # Just update the figure object (no recreation!)
@@ -159,6 +426,23 @@ class DashBoardHelper:
         return plots_dict[widget_idx]
 
     def init_plot(self, p_type, plot_func, widget_idx, **kwargs):
+        """
+        Initialize a plot panel and store it in the corresponding plot dict.
+
+        Parameters
+        ----------
+        p_type : str
+            type of the plot to initialize
+        plot_func : callable
+            function that creates the plot
+        widget_idx : int
+            index of the widget to initialize
+
+        Returns
+        -------
+        panel widget
+            the initialized plot panel
+        """
         getattr(self, f"{p_type}_plot")[widget_idx] = pn.panel(
             self.plot_widget(plot_func, widget_idx=widget_idx, **kwargs),
             tight=False,
@@ -166,21 +450,83 @@ class DashBoardHelper:
         return getattr(self, f"{p_type}_plot")[widget_idx]
 
     def plot_widget(self, plot_func, **kwargs):
+        """
+        Wrap the plot function in a panel widget, either bound to the
+        kwargs or with an added save button.
+
+        Parameters
+        ----------
+        plot_func : callable
+            function that creates the plot
+
+        Returns
+        -------
+        panel widget
+            panel object containing the plot
+        """
         if kwargs.get("return_fig", False):
-            return pn.bind(plot_func, **kwargs)
+            fig_panel = pn.panel(pn.bind(plot_func, **kwargs))
+            # Make the plot fill the available accordion width
+            fig_panel.sizing_mode = "stretch_width"
+            return fig_panel
         else:
             return self.add_save_button(plot_func, **kwargs)
 
     def widget(self, name, options, attr="Select", width=120, **kwargs):
+        """
+        Create a panel widget of the requested type.
+
+        Parameters
+        ----------
+        name : str
+            label of the widget
+        options : list
+            options for the widget
+        attr : str, optional
+            name of the panel widget class to use, by default "Select"
+        width : int, optional
+            width of the widget, by default 120
+
+        Returns
+        -------
+        panel widget
+            the created widget
+        """
         return getattr(pn.widgets, attr)(
             name=name, options=options, width=self.widget_width, **kwargs
         )
 
     def init_widget(self, idx, w_type, **kwargs):
+        """
+        Initialize a widget and store it in the corresponding select dict.
+
+        Parameters
+        ----------
+        idx : int
+            index of the widget to initialize
+        w_type : str
+            type of the widget to initialize
+
+        Returns
+        -------
+        panel widget
+            the initialized widget
+        """
         getattr(self, f"{w_type}_select")[idx] = self.widget(**kwargs)
         return getattr(self, f"{w_type}_select")[idx]
 
     def change_input_options(self, clfier_selection, widget_idx):
+        """
+        Update the classifier widget labels based on the selected
+        classifier type.
+
+        Parameters
+        ----------
+        clfier_selection : panel event
+            event containing the newly selected classifier type
+        widget_idx : int
+            index of the widget to update
+        """
         if clfier_selection.new == "Linear":
             self.btn_run_clfier[widget_idx].name = "Apply linear classifier"
             self.clfier_path[widget_idx].visible = True
@@ -191,7 +537,19 @@ class DashBoardHelper:
             self.clfier_path[widget_idx].visible = False
 
     def add_save_button(self, plot_func, **kwargs):
-        """Adds a save button to the plot panel"""
+        """
+        Adds a save button to the plot panel.
+
+        Parameters
+        ----------
+        plot_func : callable
+            function that creates the plot
+
+        Returns
+        -------
+        panel column
+            panel containing the plot and the save button
+        """
 
         # Check if this is for a Plotly plot by checking if any widgets are passed
         has_widgets = any(hasattr(v, "value") for v in kwargs.values())
@@ -203,7 +561,19 @@ class DashBoardHelper:
             # No widgets, just call the function once
             fig_panel = pn.panel(plot_func(**kwargs))
 
+        # Make the plot fill the available container width so the dashboard
+        # stays responsive when the browser window is resized.
+        fig_panel.sizing_mode = "stretch_width"
+
         def save_figure(event):
+            """
+            Save the displayed figure to the plot path.
+
+            Parameters
+            ----------
+            event : panel event
+                the event triggering the save
+            """
             # Extract values from widgets
             plot_kwargs = {}
             for key, value in kwargs.items():
@@ -237,7 +607,7 @@ class DashBoardHelper:
             # Determine save path
             if model_name == "all_models":
                 save_dir = (
-                    self.path_func(model_name).plot_path.parent.parent
+                    self.path_func(self.models[0]).plot_path.parent.parent
                     / "overview"
                 )
             else:
@@ -254,8 +624,9 @@ class DashBoardHelper:
                 else:
                     fig.savefig(save_path, dpi=300, bbox_inches="tight")
             except Exception as e:
-                logger.error(f"Error saving figure: {e}")
-                notification.object = f"✗ Error saving: {e}"
+                logger.error(f"Error saving figure: {str(e)}")
+                message = _friendly_export_error(e) or f"Error: {str(e)}"
+                notification.object = f"✗ {message}"
                 return
 
             notification.object = f"✓ Figure saved to: {save_path}"
@@ -265,4 +636,9 @@ class DashBoardHelper:
         button.on_click(save_figure)
         notification = pn.pane.Markdown("")
 
-        return pn.Column(fig_panel, pn.Row(button), notification)
+        return pn.Column(
+            fig_panel,
+            pn.Row(button),
+            notification,
+            sizing_mode="stretch_width",
+        )
